@@ -5,8 +5,7 @@ struct DashboardView: View {
     @State private var appeared = false
 
     private let modelColumns = [
-        GridItem(.flexible(), spacing: 14),
-        GridItem(.flexible(), spacing: 14),
+        GridItem(.adaptive(minimum: 350), spacing: 16),
     ]
 
     private let categoryColumns = [
@@ -27,35 +26,77 @@ struct DashboardView: View {
                 appeared = true
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if store.isRefreshing {
+                    HStack(spacing: 7) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Обновляю")
+                            .font(.custom("Avenir Next Medium", size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button {
+                        store.runAnalyzer()
+                    } label: {
+                        Label("Обновить", systemImage: "arrow.clockwise")
+                    }
+                    .keyboardShortcut("r", modifiers: .command)
+                }
+            }
+        }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 16) {
-                QuotaRing(
-                    remaining: store.quota?.remainingPercent ?? 0,
-                    diameter: 126
-                )
-                VStack(spacing: 3) {
-                    Text("Сброс \(DashboardFormat.reset(store.quota?.primaryResetAt))")
+            HStack(spacing: 11) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    DashboardPalette.accent,
+                                    Color(red: 0.08, green: 0.30, blue: 0.23),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                    Text("CQ")
                         .font(.custom("Avenir Next Demi Bold", size: 12))
-                    Text(DashboardFormat.remaining(store.quota?.primaryResetAt))
-                        .font(.custom("Avenir Next", size: 11))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 38, height: 38)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Codex Quota")
+                        .font(.custom("Avenir Next Demi Bold", size: 16))
+                    Text("Личная эффективность моделей")
+                        .font(.custom("Avenir Next", size: 10))
                         .foregroundStyle(.secondary)
                 }
+                Spacer()
             }
-            .padding(.top, 22)
-            .padding(.bottom, 18)
+            .padding(.horizontal, 15)
+            .padding(.top, 17)
+            .padding(.bottom, 20)
 
-            Picker("Режим", selection: $store.rankingMode) {
-                ForEach(RankingMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+            VStack(alignment: .leading, spacing: 7) {
+                Text("КАК ВЫБИРАТЬ МОДЕЛЬ")
+                    .font(.custom("Avenir Next Demi Bold", size: 9))
+                    .tracking(0.8)
+                    .foregroundStyle(.secondary)
+                Picker("Режим", selection: $store.rankingMode) {
+                    ForEach(RankingMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .padding(.horizontal, 14)
-            .padding(.bottom, 12)
+            .padding(.bottom, 16)
 
             List(selection: $store.selectedModelName) {
                 Section("МОДЕЛИ") {
@@ -63,38 +104,46 @@ struct DashboardView: View {
                         HStack(spacing: 10) {
                             Circle()
                                 .fill(color(for: model))
-                                .frame(width: 8, height: 8)
-                            VStack(alignment: .leading, spacing: 2) {
+                                .frame(width: 9, height: 9)
+                            VStack(alignment: .leading, spacing: 3) {
                                 Text(model.name)
-                                    .font(.custom("Avenir Next Demi Bold", size: 12))
+                                    .font(.custom("Avenir Next Demi Bold", size: 13))
                                     .lineLimit(1)
-                                Text("\(model.score(for: store.rankingMode))/100 · \(model.confidence)% уверенность")
-                                    .font(.custom("Avenir Next", size: 10))
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 5) {
+                                    Text("\(model.score(for: store.rankingMode))/100")
+                                    Text("·")
+                                    Text("\(model.confidence)% уверенность")
+                                }
+                                .font(.custom("Avenir Next", size: 10))
+                                .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if model.name == store.recommendedModel?.name {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundStyle(DashboardPalette.accent)
+                                    .help("Рекомендуемая модель")
                             }
                         }
+                        .padding(.vertical, 3)
                         .tag(Optional(model.name))
                     }
                 }
             }
             .listStyle(.sidebar)
 
-            HStack {
-                Circle()
-                    .fill(DashboardPalette.accent)
-                    .frame(width: 7, height: 7)
-                Text("Данные обновлены \(DashboardFormat.updated(store.report?.generatedAt))")
-                    .font(.custom("Avenir Next", size: 10))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    store.runAnalyzer()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(DashboardPalette.accent)
+                        .frame(width: 7, height: 7)
+                    Text("Аналитика работает локально")
+                        .font(.custom("Avenir Next Demi Bold", size: 10))
                 }
-                .buttonStyle(.plain)
-                .help("Обновить аналитику")
+                Text("Обновлено \(DashboardFormat.updated(store.report?.generatedAt)) · ⌘R для пересчёта")
+                    .font(.custom("Avenir Next", size: 9))
+                    .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
         }
         .navigationTitle("Codex Quota")
@@ -114,15 +163,15 @@ struct DashboardView: View {
             .ignoresSafeArea()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     header
-                    overview
-                    recommendation
+                    heroRow
+                    feedbackSection
                     modelSection
                     categorySection
-                    feedbackSection
+                    methodology
                 }
-                .padding(26)
+                .padding(28)
                 .opacity(appeared ? 1 : 0)
                 .offset(y: appeared ? 0 : 8)
             }
@@ -131,48 +180,74 @@ struct DashboardView: View {
 
     private var header: some View {
         HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text("ЭФФЕКТИВНОСТЬ CODEX")
                     .font(.custom("Avenir Next Demi Bold", size: 10))
                     .tracking(1.2)
                     .foregroundStyle(DashboardPalette.accent)
-                Text("Как модели справляются с твоими задачами")
-                    .font(.custom("Avenir Next Demi Bold", size: 28))
+                Text("Меньше токенов на хороший результат")
+                    .font(.custom("Avenir Next Demi Bold", size: 30))
+                Text("Сравнение учитывает переделки, сложность задачи и твою оценку.")
+                    .font(.custom("Avenir Next", size: 12))
+                    .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("30 ДНЕЙ")
-                .font(.custom("Avenir Next Demi Bold", size: 10))
-                .tracking(1)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 7)
-                .background(.thinMaterial, in: Capsule())
+            VStack(alignment: .trailing, spacing: 3) {
+                Text("30 ДНЕЙ")
+                    .font(.custom("Avenir Next Demi Bold", size: 10))
+                    .tracking(1)
+                Text("Spark исключён")
+                    .font(.custom("Avenir Next", size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 9)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
     }
 
-    private var overview: some View {
-        HStack(spacing: 12) {
-            MetricTile(
-                label: "Недельный запас",
-                value: "\(store.quota?.remainingPercent ?? 0)%",
-                detail: "\(100 - (store.quota?.remainingPercent ?? 0))% использовано"
+    private var heroRow: some View {
+        HStack(alignment: .top, spacing: 16) {
+            quotaCard
+                .frame(width: 282)
+            recommendationCard
+        }
+    }
+
+    private var quotaCard: some View {
+        HStack(spacing: 17) {
+            QuotaRing(
+                remaining: store.quota?.remainingPercent ?? 0,
+                diameter: 104
             )
-            MetricTile(
-                label: "Следующий сброс",
-                value: DashboardFormat.reset(store.quota?.primaryResetAt),
-                detail: DashboardFormat.remaining(store.quota?.primaryResetAt),
-                tint: DashboardPalette.blue
-            )
-            MetricTile(
-                label: "Ручные сбросы",
-                value: "\(store.quota?.resetCreditCount ?? 0)",
-                detail: "доступно сейчас",
-                tint: DashboardPalette.amber
-            )
+            VStack(alignment: .leading, spacing: 7) {
+                Text("НЕДЕЛЬНЫЙ ЛИМИТ")
+                    .font(.custom("Avenir Next Demi Bold", size: 9))
+                    .tracking(0.9)
+                    .foregroundStyle(DashboardPalette.accent)
+                Text(DashboardFormat.reset(store.quota?.primaryResetAt))
+                    .font(.custom("Avenir Next Demi Bold", size: 17))
+                Text(DashboardFormat.remaining(store.quota?.primaryResetAt))
+                    .font(.custom("Avenir Next", size: 11))
+                    .foregroundStyle(.secondary)
+                Label(
+                    "\(store.quota?.resetCreditCount ?? 0) ручной сброс",
+                    systemImage: "arrow.counterclockwise.circle"
+                )
+                .font(.custom("Avenir Next Medium", size: 10))
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(19)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(.primary.opacity(0.07), lineWidth: 1)
         }
     }
 
     @ViewBuilder
-    private var recommendation: some View {
+    private var recommendationCard: some View {
         if let model = store.recommendedModel {
             HStack(spacing: 20) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -180,12 +255,17 @@ struct DashboardView: View {
                         .font(.custom("Avenir Next Demi Bold", size: 9))
                         .tracking(1)
                         .foregroundStyle(Color.white.opacity(0.62))
-                    Text(model.name)
-                        .font(.custom("Avenir Next Demi Bold", size: 25))
-                        .foregroundStyle(.white)
-                    Text("\(model.tasks) задач · \(model.confidence)% уверенность")
-                        .font(.custom("Avenir Next", size: 12))
-                        .foregroundStyle(Color.white.opacity(0.62))
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(model.name)
+                            .font(.custom("Avenir Next Demi Bold", size: 25))
+                            .foregroundStyle(.white)
+                        Text("\(model.score(for: store.rankingMode))/100")
+                            .font(.custom("Avenir Next Demi Bold", size: 14))
+                            .foregroundStyle(Color.white.opacity(0.74))
+                    }
+                    Text("Цена принятого результата: \(DashboardFormat.tokens(model.tokensPerAcceptedResult)) токенов")
+                        .font(.custom("Avenir Next", size: 11))
+                        .foregroundStyle(Color.white.opacity(0.66))
                 }
                 Spacer()
                 recommendationMetric(
@@ -200,13 +280,16 @@ struct DashboardView: View {
                     "Скорость",
                     model.speedScore ?? 0
                 )
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text(DashboardFormat.tokens(model.tokensPerAcceptedResult))
-                        .font(.custom("Avenir Next Demi Bold", size: 18))
+                VStack(alignment: .trailing, spacing: 5) {
+                    Text("\(model.confidence)%")
+                        .font(.custom("Avenir Next Demi Bold", size: 20))
                         .foregroundStyle(.white)
-                    Text("токенов на принятый результат")
-                        .font(.custom("Avenir Next", size: 10))
+                    Text("уверенность")
+                        .font(.custom("Avenir Next", size: 9))
                         .foregroundStyle(Color.white.opacity(0.55))
+                    Text("\(model.tasks) задач")
+                        .font(.custom("Avenir Next Medium", size: 10))
+                        .foregroundStyle(Color.white.opacity(0.72))
                 }
             }
             .padding(21)
@@ -222,6 +305,17 @@ struct DashboardView: View {
                 in: RoundedRectangle(cornerRadius: 22)
             )
             .shadow(color: DashboardPalette.accent.opacity(0.17), radius: 20, y: 10)
+        } else {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Собираю рекомендацию")
+                    .font(.custom("Avenir Next Demi Bold", size: 20))
+                Text("Нужно несколько сопоставимых задач с реакцией пользователя.")
+                    .font(.custom("Avenir Next", size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(21)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
         }
     }
 
@@ -239,12 +333,12 @@ struct DashboardView: View {
     }
 
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 13) {
             sectionTitle(
                 "Сравнение моделей",
-                "Рейтинг меняется вместе с выбранным режимом"
+                "Нажми на карточку, чтобы закрепить модель в боковой панели"
             )
-            LazyVGrid(columns: modelColumns, spacing: 14) {
+            LazyVGrid(columns: modelColumns, spacing: 16) {
                 ForEach(store.sortedModels) { model in
                     ModelAnalyticsCard(
                         model: model,
@@ -253,7 +347,9 @@ struct DashboardView: View {
                     )
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        store.selectedModelName = model.name
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            store.selectedModelName = model.name
+                        }
                     }
                 }
             }
@@ -264,10 +360,10 @@ struct DashboardView: View {
     private var categorySection: some View {
         let categories = store.report?.categoryRecommendations ?? []
         if !categories.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 13) {
                 sectionTitle(
                     "Лучшие модели по типу задачи",
-                    "Стоимость считается по всей цепочке переделок"
+                    "Сравниваются только похожие задачи"
                 )
                 LazyVGrid(columns: categoryColumns, spacing: 12) {
                     ForEach(categories) { item in
@@ -282,8 +378,16 @@ struct DashboardView: View {
     private var feedbackSection: some View {
         if let latest = store.report?.latestUnrated {
             HStack(spacing: 18) {
+                ZStack {
+                    Circle()
+                        .fill(DashboardPalette.accent.opacity(0.13))
+                    Image(systemName: "checkmark.message")
+                        .foregroundStyle(DashboardPalette.accent)
+                }
+                .frame(width: 42, height: 42)
+
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("ОЦЕНИТЬ ПОСЛЕДНИЙ РЕЗУЛЬТАТ · \(latest.model)")
+                    Text("ПОМОГИ УТОЧНИТЬ РЕЙТИНГ · \(latest.model)")
                         .font(.custom("Avenir Next Demi Bold", size: 9))
                         .tracking(0.8)
                         .foregroundStyle(DashboardPalette.accent)
@@ -306,19 +410,37 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
-            .padding(18)
+            .padding(17)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
             .overlay {
                 RoundedRectangle(cornerRadius: 18)
-                    .stroke(.primary.opacity(0.07), lineWidth: 1)
+                    .stroke(DashboardPalette.accent.opacity(0.15), lineWidth: 1)
             }
         }
+    }
+
+    private var methodology: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 20))
+                .foregroundStyle(DashboardPalette.accent)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Как считается рейтинг")
+                    .font(.custom("Avenir Next Demi Bold", size: 13))
+                Text("70% результат · 20% цена принятого результата · 10% скорость. Низкая уверенность означает, что данных пока мало.")
+                    .font(.custom("Avenir Next", size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(15)
+        .background(DashboardPalette.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
     }
 
     private func sectionTitle(_ title: String, _ detail: String) -> some View {
         HStack(alignment: .lastTextBaseline) {
             Text(title)
-                .font(.custom("Avenir Next Demi Bold", size: 19))
+                .font(.custom("Avenir Next Demi Bold", size: 20))
             Spacer()
             Text(detail)
                 .font(.custom("Avenir Next", size: 11))

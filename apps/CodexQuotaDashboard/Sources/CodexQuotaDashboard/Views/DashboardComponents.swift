@@ -101,6 +101,7 @@ struct ScoreBar: View {
                 }
             }
             .frame(height: 6)
+            .animation(.easeOut(duration: 0.45), value: value)
         }
     }
 }
@@ -121,6 +122,10 @@ struct ModelAnalyticsCard: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
+                    Text(mode.rawValue.uppercased())
+                        .font(.custom("Avenir Next Demi Bold", size: 8))
+                        .tracking(0.9)
+                        .foregroundStyle(scoreColor)
                     Text(model.name)
                         .font(.custom("Avenir Next Demi Bold", size: 17))
                         .lineLimit(1)
@@ -138,6 +143,15 @@ struct ModelAnalyticsCard: View {
                         .font(.custom("Avenir Next Medium", size: 10))
                         .foregroundStyle(.secondary)
                 }
+            }
+
+            if model.confidence < 25 {
+                Label(
+                    "Предварительная оценка: пока мало сопоставимых задач",
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.custom("Avenir Next Medium", size: 10))
+                .foregroundStyle(.secondary)
             }
 
             ScoreBar(
@@ -200,6 +214,7 @@ struct CompactValue: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -225,6 +240,19 @@ struct CategoryCard: View {
             Text("\(item.confidence)% уверенность · \(item.tasks) задач")
                 .font(.custom("Avenir Next", size: 10))
                 .foregroundStyle(.secondary)
+            GeometryReader { geometry in
+                Capsule()
+                    .fill(DashboardPalette.accent.opacity(0.16))
+                    .overlay(alignment: .leading) {
+                        Capsule()
+                            .fill(DashboardPalette.accent)
+                            .frame(
+                                width: geometry.size.width
+                                    * CGFloat(max(0, min(100, item.confidence))) / 100
+                            )
+                    }
+            }
+            .frame(height: 4)
         }
         .padding(15)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))

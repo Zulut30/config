@@ -4,12 +4,18 @@ import Foundation
 final class DashboardStore: ObservableObject {
     @Published private(set) var quota: QuotaSnapshot?
     @Published private(set) var report: QualityReport?
-    @Published var rankingMode: RankingMode = .balance
+    @Published var rankingMode: RankingMode {
+        didSet {
+            UserDefaults.standard.set(rankingMode.rawValue, forKey: "rankingMode")
+        }
+    }
     @Published var selectedModelName: String?
     @Published private(set) var feedbackMessage: String?
+    @Published private(set) var isRefreshing = false
 
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private var refreshTimer: Timer?
+    private var analyzerProcess: Process?
 
     private var cacheDirectory: URL {
         home
@@ -37,6 +43,9 @@ final class DashboardStore: ObservableObject {
     }
 
     init() {
+        rankingMode = RankingMode(
+            rawValue: UserDefaults.standard.string(forKey: "rankingMode") ?? ""
+        ) ?? .balance
         reload()
         runAnalyzer()
         refreshTimer = Timer.scheduledTimer(
@@ -82,15 +91,26 @@ final class DashboardStore: ObservableObject {
     }
 
     func runAnalyzer() {
+        guard analyzerProcess == nil else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = [analyzerURL.path]
+        analyzerProcess = process
+        isRefreshing = true
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self?.analyzerProcess = nil
+                self?.isRefreshing = false
                 self?.reload()
             }
         }
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            analyzerProcess = nil
+            isRefreshing = false
+            feedbackMessage = "Не удалось запустить обновление"
+        }
     }
 
     func submitFeedback(_ verdict: String) {
