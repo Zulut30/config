@@ -370,6 +370,8 @@ codexQuotaMenu:setClickCallback(showCodexQuotaPanel)
 -- Clean macOS-style dashboard. Keep data collection and menu bar behavior intact.
 local efficiencyHistoryPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/efficiency-history.json"
 local efficiencyStatusPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/status.json"
+local modelQualityPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/model-quality.json"
+local modelQualityScriptPath = os.getenv("HOME") .. "/.hammerspoon/codex_model_quality.py"
 
 local function readQuotaJSON(path)
     local file = io.open(path, "r")
@@ -512,6 +514,11 @@ quotaPanelHTML = function(data)
     data = data or {}
     recordModelEfficiency(data)
     local efficiencyHistory = readQuotaJSON(efficiencyHistoryPath) or {}
+    local modelQuality = readQuotaJSON(modelQualityPath) or {}
+    local qualityByModel = {}
+    for _, item in ipairs(modelQuality.models or {}) do
+        qualityByModel[tostring(item.name or "")] = item
+    end
 
     local function clamp(value, minimum, maximum)
         value = tonumber(value) or 0
@@ -687,6 +694,64 @@ quotaPanelHTML = function(data)
         end
 
         local sparklineHTML = buildSparkline(item.name, color, efficiencyIndex)
+        local quality = qualityByModel[item.name]
+        local qualityHTML = [[
+            <div class="quality-block quality-pending">
+                <div>
+                    <span class="quality-label">Качество результата</span>
+                    <strong>Собираю сигналы</strong>
+                </div>
+                <span class="quality-confidence">нужна история</span>
+            </div>
+        ]]
+
+        if quality then
+            local score = tonumber(quality.score) or 0
+            local confidence = tonumber(quality.confidence) or 0
+            local firstPass = quality.firstPassRate ~= nil
+                and (tostring(math.floor(tonumber(quality.firstPassRate) or 0)) .. "%")
+                or "—"
+            local toolSuccess = quality.toolSuccessRate ~= nil
+                and (tostring(math.floor(tonumber(quality.toolSuccessRate) or 0)) .. "%")
+                or "—"
+            local qualityClass = "quality-average"
+            local qualityVerdict = "стабильно"
+
+            if confidence < 25 then
+                qualityClass = "quality-sample"
+                qualityVerdict = "низкая уверенность"
+            elseif score >= 80 then
+                qualityClass = "quality-good"
+                qualityVerdict = "сильный результат"
+            elseif score < 65 then
+                qualityClass = "quality-watch"
+                qualityVerdict = "нужна проверка"
+            end
+
+            qualityHTML = string.format([[
+                <div class="quality-block %s">
+                    <div class="quality-score">
+                        <span class="quality-label">Справляется</span>
+                        <div><strong>%d</strong><small>/100</small></div>
+                    </div>
+                    <div class="quality-signals">
+                        <span>С первой попытки <b>%s</b></span>
+                        <span>Команды <b>%s</b></span>
+                    </div>
+                    <div class="quality-state">
+                        <b>%s</b>
+                        <span>уверенность %d%%</span>
+                    </div>
+                </div>
+            ]],
+                qualityClass,
+                score,
+                firstPass,
+                toolSuccess,
+                qualityVerdict,
+                confidence
+            )
+        end
 
         table.insert(compositionSegments, string.format(
             '<span style="width:%d%%;background:%s" title="%s: %d%%"></span>',
@@ -707,11 +772,12 @@ quotaPanelHTML = function(data)
                 </div>
                 <div class="track"><span style="width:%d%%;background:%s"></span></div>
                 <div class="model-summary">%s токенов · %d задач · %s</div>
+                %s
                 <div class="efficiency-block">
                     <div class="efficiency-head">
                         <div class="efficiency-index">
                             <b>%d</b>
-                            <span>индекс</span>
+                            <span>экономичность</span>
                         </div>
                         <span class="efficiency-verdict %s">%s</span>
                     </div>
@@ -735,6 +801,7 @@ quotaPanelHTML = function(data)
             formatTokens(item.tokens),
             item.tasks,
             formatDuration(item.seconds),
+            qualityHTML,
             efficiencyIndex,
             verdictClass,
             verdict,
@@ -750,16 +817,16 @@ quotaPanelHTML = function(data)
         and os.date("%d.%m, %H:%M", tonumber(efficiencyHistory.startedAt))
         or "сейчас"
     local efficiencyHTML = string.format([[
-        <div class="method-mark">100</div>
+        <div class="method-mark">Q</div>
         <div class="method-copy">
-            <span class="eyebrow">ТРЕКЕР ЭФФЕКТИВНОСТИ ВКЛЮЧЁН</span>
-            <h3>История сохраняется автоматически</h3>
-            <p>Снимок каждые 15 минут, дневные приращения хранятся 30 дней. Наблюдение начато %s.</p>
+            <span class="eyebrow">РЕЙТИНГ «КАК СПРАВЛЯЕТСЯ»</span>
+            <h3>Результат 70%% · экономичность 20%% · скорость 10%%</h3>
+            <p>Главный сигнал — отсутствие переделки после финального ответа. Уверенность растёт с числом задач и реакций. История расхода ведётся с %s.</p>
         </div>
         <div class="method-scale">
-            <span class="scale-good">110+ экономнее</span>
-            <span class="scale-average">90–109 средне</span>
-            <span class="scale-watch">&lt;90 ресурсоёмко</span>
+            <span class="scale-good">80+ сильный результат</span>
+            <span class="scale-average">65–79 стабильно</span>
+            <span class="scale-watch">&lt;65 проверить</span>
         </div>
     ]], trackingSince)
 
@@ -1114,6 +1181,118 @@ quotaPanelHTML = function(data)
         white-space: nowrap;
     }
 
+    .quality-block {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+        padding: 9px 10px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: rgba(255,255,255,.76);
+    }
+
+    .quality-score {
+        min-width: 62px;
+        padding-right: 10px;
+        border-right: 1px solid var(--line);
+    }
+
+    .quality-label {
+        display: block;
+        margin-bottom: 2px;
+        color: var(--muted);
+        font-size: 7px;
+        font-weight: 800;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+    }
+
+    .quality-score div {
+        display: flex;
+        align-items: baseline;
+        gap: 2px;
+    }
+
+    .quality-score strong {
+        font-size: 21px;
+        line-height: 1;
+        letter-spacing: -.055em;
+    }
+
+    .quality-score small {
+        color: var(--muted);
+        font-size: 8px;
+        font-weight: 700;
+    }
+
+    .quality-signals {
+        display: grid;
+        gap: 3px;
+        color: var(--muted);
+        font-size: 8px;
+    }
+
+    .quality-signals b { color: var(--ink); }
+
+    .quality-state {
+        display: grid;
+        justify-items: end;
+        gap: 2px;
+        text-align: right;
+    }
+
+    .quality-state b {
+        padding: 3px 6px;
+        border-radius: 6px;
+        font-size: 7px;
+        white-space: nowrap;
+    }
+
+    .quality-state span {
+        color: var(--muted);
+        font-size: 7px;
+    }
+
+    .quality-good .quality-state b {
+        color: #187356;
+        background: var(--green-soft);
+    }
+
+    .quality-average .quality-state b {
+        color: #55615B;
+        background: #E3E7E4;
+    }
+
+    .quality-watch .quality-state b {
+        color: var(--amber);
+        background: var(--amber-soft);
+    }
+
+    .quality-sample .quality-state b,
+    .quality-pending .quality-confidence {
+        color: #5F6690;
+        background: #E6E8F4;
+    }
+
+    .quality-pending {
+        grid-template-columns: 1fr auto;
+        color: var(--muted);
+    }
+
+    .quality-pending strong {
+        font-size: 10px;
+        color: var(--ink);
+    }
+
+    .quality-confidence {
+        padding: 3px 6px;
+        border-radius: 6px;
+        font-size: 7px;
+        font-weight: 800;
+    }
+
     .efficiency-block {
         margin-top: 10px;
         padding: 9px 10px 8px;
@@ -1430,6 +1609,17 @@ codexQuotaEfficiencyTimer = hs.timer.doEvery(900, function()
         recordModelEfficiency(status)
     end
 end)
+
+local function refreshModelQuality()
+    local command = string.format(
+        "/usr/bin/python3 %q >/dev/null 2>&1 &",
+        modelQualityScriptPath
+    )
+    hs.execute(command)
+end
+
+refreshModelQuality()
+codexModelQualityTimer = hs.timer.doEvery(1800, refreshModelQuality)
   else
     codexQuotaMenu:setTitle("--")
     codexQuotaMenu:setTooltip("Codex: ожидаю первое обновление лимита")
