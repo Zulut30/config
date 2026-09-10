@@ -37,8 +37,32 @@ CORRECTION_RE = re.compile(
     r"\bничего\s+не\b|\bты\s+не\b|\bне\s+сделал[оа]?\b|"
     r"\bне\s+так\b|\bне\s+то\b|\bне\s+открыва\w*\b|"
     r"\bне\s+показыва\w*\b|\bне\s+нравится\b|\bисправь\b|"
-    r"\bпеределай\b|\bошибк\w*\b|\bсломал\w*\b|"
+    r"\bпеределай\b|\bошибк\w*\b|\bпроблем\w*\b|\bсломал\w*\b|"
     r"doesn['’]?t\s+work|still\s+not|\bwrong\b|\bfix\s+(?:it|this)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+DIRECT_REWORK_RE = re.compile(
+    r"^(?:"
+    r"не\s+работает|не\s+сработал[оа]?|вс[её]\s+ещ[её]|ничего\s+не|"
+    r"ты\s+не|это\s+не|не\s+так|не\s+то|тут\s+проблем|здесь\s+проблем|"
+    r"стало\s+хуже|снова\s+не|опять\s+не|still\s+not|doesn['’]?t\s+work"
+    r")",
+    re.IGNORECASE,
+)
+
+REWORK_REFERENCE_RE = re.compile(
+    r"\b(?:это|тут|здесь|снова|опять|ещ[её]|предыдущ\w*|ты|результат|"
+    r"верстк\w*|дизайн|кнопк\w*|панел\w*|it|this|that|again|still)\b",
+    re.IGNORECASE,
+)
+
+POSITIVE_FEEDBACK_RE = re.compile(
+    r"^(?:"
+    r"вс[её]\s+(?:работает|нормально|хорошо)|теперь\s+(?:работает|нормально)|"
+    r"отлично|идеально|подошло|получилось|готово|спасибо(?:,|\s|$)|"
+    r"works\b|looks\s+good\b|perfect\b|great\b|thanks(?:,|\s|$)"
     r")",
     re.IGNORECASE,
 )
@@ -331,6 +355,24 @@ def load_feedback() -> dict[str, str]:
     return result
 
 
+def explicit_feedback_signal(message: str) -> tuple[str | None, float]:
+    compact = re.sub(r"\s+", " ", message).strip()
+    if not compact:
+        return None, 0.0
+    preview = compact[:600]
+    if DIRECT_REWORK_RE.search(preview):
+        return "rework", 1.0
+    if (
+        len(compact) <= 360
+        and CORRECTION_RE.search(preview)
+        and REWORK_REFERENCE_RE.search(preview)
+    ):
+        return "rework", 0.85
+    if len(compact) <= 220 and POSITIVE_FEEDBACK_RE.search(preview):
+        return "good", 0.8
+    return None, 0.0
+
+
 def enrich_outcomes(turns: list[dict[str, Any]], feedback: dict[str, str]) -> None:
     by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for turn in turns:
@@ -341,14 +383,20 @@ def enrich_outcomes(turns: list[dict[str, Any]], feedback: dict[str, str]) -> No
         for index, turn in enumerate(thread_turns):
             turn["feedbackKnown"] = False
             turn["needsRework"] = False
+            turn["feedbackStrength"] = 0.0
+            turn["feedbackSource"] = "unknown"
             if index + 1 >= len(thread_turns):
                 continue
             following = thread_turns[index + 1]
             gap = (following["startedAt"] or 0) - (turn["endedAt"] or turn["startedAt"] or 0)
-            if gap < 0 or gap > 24 * 3600:
+            if gap < 0 or gap > 6 * 3600:
                 continue
-            turn["feedbackKnown"] = True
-            turn["needsRework"] = bool(CORRECTION_RE.search(following["prompt"]))
+            verdict, strength = explicit_feedback_signal(following["prompt"])
+            if verdict:
+                turn["feedbackKnown"] = True
+                turn["needsRework"] = verdict == "rework"
+                turn["feedbackStrength"] = strength
+                turn["feedbackSource"] = f"explicit-{verdict}"
 
     for turn in turns:
         verdict = feedback.get(turn["turnId"])
@@ -356,6 +404,19 @@ def enrich_outcomes(turns: list[dict[str, Any]], feedback: dict[str, str]) -> No
             turn["feedbackKnown"] = True
             turn["needsRework"] = verdict == "rework"
             turn["manualFeedback"] = True
+            turn["feedbackStrength"] = 2.5
+            turn["feedbackSource"] = "manual"
+        elif not turn["feedbackKnown"] and turn["completed"] and turn["hasFinal"]:
+            if turn["lastTestFailed"] is False:
+                turn["feedbackKnown"] = True
+                turn["needsRework"] = False
+                turn["feedbackStrength"] = 0.45
+                turn["feedbackSource"] = "validation-pass"
+            elif turn["lastTestFailed"] is True:
+                turn["feedbackKnown"] = True
+                turn["needsRework"] = True
+                turn["feedbackStrength"] = 0.65
+                turn["feedbackSource"] = "validation-fail"
 
 
 def classify_category(prompt: str) -> tuple[str, str]:
@@ -524,6 +585,8 @@ def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             1.0, chain["complexity"]
         )
         chain["manualFeedback"] = any(item["manualFeedback"] for item in attempts)
+        chain["feedbackStrength"] = float(last.get("feedbackStrength") or 0)
+        chain["feedbackSource"] = str(last.get("feedbackSource") or "unknown")
     return chains
 
 
@@ -555,6 +618,8 @@ def write_ledger(chains: list[dict[str, Any]]) -> None:
                     "tokensPerComplexity": round(chain["tokensPerComplexity"], 1),
                     "secondsPerComplexity": round(chain["secondsPerComplexity"], 1),
                     "manualFeedback": chain["manualFeedback"],
+                    "feedbackStrength": round(chain["feedbackStrength"], 2),
+                    "feedbackSource": chain["feedbackSource"],
                 }
                 handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
                 handle.write("\n")
@@ -613,6 +678,18 @@ def safe_comparison_index(value: float, baseline: float) -> float:
     if value <= 0 or baseline <= 0:
         return 1.0
     return value / baseline
+
+
+def quality_evidence_weight(chain: dict[str, Any]) -> float:
+    return recency_weight(chain["startedAt"]) * float(
+        chain.get("feedbackStrength") or 0
+    )
+
+
+def quality_stratum(chain: dict[str, Any]) -> tuple[str, str]:
+    value = float(chain.get("complexity") or 1)
+    bucket = "low" if value < 3 else "medium" if value < 5 else "high"
+    return str(chain.get("category") or "general"), bucket
 
 
 def weighted_median(values: list[tuple[float, float]]) -> float:
@@ -701,6 +778,28 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         if any(chain["secondsPerComplexity"] > 0 for chain in items)
     }
 
+    quality_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for chain in chains:
+        if chain["accepted"] is not None and chain["feedbackStrength"] > 0:
+            quality_groups[quality_stratum(chain)].append(chain)
+    quality_priors: dict[tuple[str, str], tuple[float, float]] = {}
+    for stratum, items in quality_groups.items():
+        evidence = sum(quality_evidence_weight(chain) for chain in items)
+        accepted = sum(
+            quality_evidence_weight(chain)
+            for chain in items
+            if chain["accepted"]
+        )
+        first_pass = sum(
+            quality_evidence_weight(chain)
+            for chain in items
+            if chain["accepted"] and chain["attempts"] == 1
+        )
+        quality_priors[stratum] = (
+            bayesian_rate(accepted, evidence, prior_mean=0.55, prior_strength=6),
+            bayesian_rate(first_pass, evidence, prior_mean=0.50, prior_strength=6),
+        )
+
     raw_models = []
     for model, items in grouped.items():
         model_chains = chains_by_model.get(model, [])
@@ -731,18 +830,35 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         first_pass_rate = (
             len(first_pass) / len(known_chains) if known_chains else None
         )
-        weighted_known = sum(
-            2.0 if chain["manualFeedback"] else 1.0 for chain in known_chains
-        )
+        weighted_known = sum(quality_evidence_weight(chain) for chain in known_chains)
         weighted_accepted = sum(
-            (2.0 if chain["manualFeedback"] else 1.0)
+            quality_evidence_weight(chain)
             for chain in known_chains
             if chain["accepted"]
         )
         weighted_first_pass = sum(
-            (2.0 if chain["manualFeedback"] else 1.0)
+            quality_evidence_weight(chain)
             for chain in known_chains
             if chain["accepted"] and chain["attempts"] == 1
+        )
+        prior_weights = [quality_evidence_weight(chain) for chain in known_chains]
+        quality_prior = (
+            sum(
+                quality_priors.get(quality_stratum(chain), (0.55, 0.50))[0] * weight
+                for chain, weight in zip(known_chains, prior_weights)
+            )
+            / sum(prior_weights)
+            if sum(prior_weights) > 0
+            else 0.55
+        )
+        first_pass_prior = (
+            sum(
+                quality_priors.get(quality_stratum(chain), (0.55, 0.50))[1] * weight
+                for chain, weight in zip(known_chains, prior_weights)
+            )
+            / sum(prior_weights)
+            if sum(prior_weights) > 0
+            else 0.50
         )
         acceptance_rate = (
             len(accepted_chains) / len(known_chains) if known_chains else None
@@ -771,8 +887,26 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
 
         outcome_score = weighted_available(
             [
-                (bayesian_rate(weighted_accepted, weighted_known) * 100, 0.45),
-                (bayesian_rate(weighted_first_pass, weighted_known) * 100, 0.25),
+                (
+                    bayesian_rate(
+                        weighted_accepted,
+                        weighted_known,
+                        prior_mean=quality_prior,
+                        prior_strength=6,
+                    )
+                    * 100,
+                    0.60,
+                ),
+                (
+                    bayesian_rate(
+                        weighted_first_pass,
+                        weighted_known,
+                        prior_mean=first_pass_prior,
+                        prior_strength=6,
+                    )
+                    * 100,
+                    0.20,
+                ),
                 (
                     bayesian_rate(
                         completion_rate * tasks if completion_rate is not None else 0,
@@ -780,7 +914,7 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                         prior_mean=0.8,
                     )
                     * 100,
-                    0.15,
+                    0.10,
                 ),
                 (
                     bayesian_rate(
@@ -791,7 +925,7 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                     * 100
                     if commands
                     else None,
-                    0.10,
+                    0.05,
                 ),
                 (
                     bayesian_rate(
@@ -856,6 +990,17 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                 "tests": tests,
                 "validatedTasks": len(validated_tasks),
                 "manualRatings": sum(bool(item["manualFeedback"]) for item in items),
+                "explicitRatings": sum(
+                    chain["feedbackSource"].startswith("explicit-")
+                    for chain in model_chains
+                ),
+                "validatedRatings": sum(
+                    chain["feedbackSource"].startswith("validation-")
+                    for chain in model_chains
+                ),
+                "unknownTasks": sum(chain["accepted"] is None for chain in model_chains),
+                "qualityEvidenceWeight": round(weighted_known, 2),
+                "qualityPrior": round(quality_prior * 100),
                 "outputTokens": output_tokens,
                 "totalTokens": total_tokens,
                 "effectiveTokens": round(effective_tokens),
@@ -1092,7 +1237,7 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         for turn in turns
         if turn["completed"]
         and turn["hasFinal"]
-        and not turn["manualFeedback"]
+        and not turn["feedbackKnown"]
         and (time.time() - (turn["startedAt"] or 0)) <= 7 * 86400
     ]
     if candidates:
@@ -1108,15 +1253,21 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         }
 
     return {
-        "version": 3,
+        "version": 4,
         "generatedAt": int(time.time()),
         "periodDays": PERIOD_DAYS,
         "methodology": {
             "resultWeight": 60,
             "efficiencyWeight": 25,
             "speedWeight": 15,
-            "acceptanceShareOfResult": 45,
-            "firstPassShareOfResult": 25,
+            "acceptanceShareOfResult": 60,
+            "firstPassShareOfResult": 20,
+            "completionShareOfResult": 10,
+            "toolReliabilityShareOfResult": 5,
+            "validationShareOfResult": 5,
+            "manualFeedbackWeight": 2.5,
+            "explicitFeedbackWindowHours": 6,
+            "qualityPrior": "category-and-complexity-stratum",
             "comparison": "category-and-complexity-normalized",
             "tokenMetric": "relative-effective-token-load",
             "recencyHalfLifeDays": RECENCY_HALF_LIFE_DAYS,
