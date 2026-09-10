@@ -288,7 +288,7 @@ end
 
 local function showCodexQuotaPanel()
   local quota = hs.json.read(codexQuotaFile)
-  local screen = hs.screen.mainScreen():visibleFrame()
+  local screen = hs.screen.mainScreen():frame()
   local width = math.min(780, screen.w - 48)
   local height = math.min(610, screen.h - 80)
   local frame = {
