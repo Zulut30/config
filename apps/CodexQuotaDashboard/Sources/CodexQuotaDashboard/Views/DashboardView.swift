@@ -130,6 +130,8 @@ struct DashboardView: View {
                 }
             }
             .listStyle(.sidebar)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
 
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 7) {
