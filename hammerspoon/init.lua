@@ -445,11 +445,31 @@ quotaPanelHTML = function(data)
     local colors = { "#2E9B78", "#E99A3E", "#527FD7", "#C4688B", "#7C6BB4" }
     local modelRows = {}
     local compositionSegments = {}
+    local averagePerTask = totalTasks > 0 and totalTokens / totalTasks or 0
 
     for index, item in ipairs(models) do
         local share = totalTokens > 0 and math.floor((item.tokens / totalTokens) * 100 + 0.5) or 0
         local color = colors[((index - 1) % #colors) + 1]
         local safeName = htmlEscape(item.name)
+        local perTask = item.tasks > 0 and item.tokens / item.tasks or 0
+        local tasksPerHour = item.seconds > 0 and item.tasks / (item.seconds / 3600) or 0
+        local ratio = averagePerTask > 0 and perTask / averagePerTask or 0
+        local efficiencyIndex = ratio > 0 and math.floor((1 / ratio) * 100 + 0.5) or 0
+        local meterWidth = clamp(efficiencyIndex / 1.5, 3, 100)
+        local difference = math.floor(math.abs(ratio - 1) * 100 + 0.5)
+        local verdictClass = "average"
+        local verdict = "на уровне среднего"
+
+        if item.tasks < 5 then
+            verdictClass = "sample"
+            verdict = "мало данных"
+        elseif ratio <= 0.95 then
+            verdictClass = "good"
+            verdict = string.format("на %d%% экономнее", difference)
+        elseif ratio >= 1.05 then
+            verdictClass = "watch"
+            verdict = string.format("на %d%% ресурсоёмче", difference)
+        end
 
         table.insert(compositionSegments, string.format(
             '<span style="width:%d%%;background:%s" title="%s: %d%%"></span>',
@@ -469,10 +489,23 @@ quotaPanelHTML = function(data)
                     <span class="model-share">%d%%</span>
                 </div>
                 <div class="track"><span style="width:%d%%;background:%s"></span></div>
-                <div class="model-metrics">
-                    <span><b>%s</b> токенов</span>
-                    <span><b>%d</b> задач</span>
-                    <span><b>%s</b> работы</span>
+                <div class="model-summary">%s токенов · %d задач · %s</div>
+                <div class="efficiency-block">
+                    <div class="efficiency-head">
+                        <div class="efficiency-index">
+                            <b>%d</b>
+                            <span>индекс</span>
+                        </div>
+                        <span class="efficiency-verdict %s">%s</span>
+                    </div>
+                    <div class="efficiency-track">
+                        <span style="width:%.1f%%;background:%s"></span>
+                        <i></i>
+                    </div>
+                    <div class="efficiency-metrics">
+                        <span><b>%s</b> / задача</span>
+                        <span><b>%.1f</b> задач / час</span>
+                    </div>
                 </div>
             </article>
         ]],
@@ -483,59 +516,30 @@ quotaPanelHTML = function(data)
             color,
             formatTokens(item.tokens),
             item.tasks,
-            formatDuration(item.seconds)
+            formatDuration(item.seconds),
+            efficiencyIndex,
+            verdictClass,
+            verdict,
+            meterWidth,
+            color,
+            formatTokens(perTask),
+            tasksPerHour
         ))
     end
 
-    local focusModel = nil
-    for _, item in ipairs(models) do
-        if item.name == "gpt-6-astra" then
-            focusModel = item
-            break
-        end
-    end
-
     local efficiencyHTML = [[
-        <div class="empty-insight">Для gpt-6-astra пока недостаточно данных.</div>
+        <div class="method-mark">100</div>
+        <div class="method-copy">
+            <span class="eyebrow">КАК ЧИТАТЬ ЭФФЕКТИВНОСТЬ</span>
+            <h3>Индекс сравнивает расход на задачу</h3>
+            <p>100 — твой средний уровень. Выше 100 модель тратит меньше токенов на задачу, ниже 100 — больше.</p>
+        </div>
+        <div class="method-scale">
+            <span class="scale-good">110+ экономнее</span>
+            <span class="scale-average">90–109 средне</span>
+            <span class="scale-watch">&lt;90 ресурсоёмко</span>
+        </div>
     ]]
-
-    if focusModel and focusModel.tasks > 0 then
-        local perTask = focusModel.tokens / focusModel.tasks
-        local averagePerTask = totalTasks > 0 and totalTokens / totalTasks or 0
-        local ratio = averagePerTask > 0 and perTask / averagePerTask or 0
-        local delta = math.floor(math.abs(ratio - 1) * 100 + 0.5)
-        local tasksPerHour = focusModel.seconds > 0 and focusModel.tasks / (focusModel.seconds / 3600) or 0
-        local verdictClass = ratio <= 1 and "good" or "watch"
-        local verdict
-
-        if ratio <= 0.9 then
-            verdict = string.format("на %d%% экономнее среднего", delta)
-        elseif ratio <= 1.1 then
-            verdict = "примерно на уровне среднего"
-        else
-            verdict = string.format("на %d%% ресурсоёмче среднего", delta)
-        end
-
-        efficiencyHTML = string.format([[
-            <div class="insight-copy">
-                <span class="eyebrow">ЭФФЕКТИВНОСТЬ МОДЕЛИ</span>
-                <h3>gpt-6-astra</h3>
-                <p class="verdict %s">%s</p>
-                <p class="explanation">Сравнение основано на сгенерированных токенах на одну завершённую задачу за 7 дней.</p>
-            </div>
-            <div class="insight-stats">
-                <div><b>%s</b><span>токенов / задача</span></div>
-                <div><b>%.1f</b><span>задач / час</span></div>
-                <div><b>%d</b><span>задач всего</span></div>
-            </div>
-        ]],
-            verdictClass,
-            verdict,
-            formatTokens(perTask),
-            tasksPerHour,
-            focusModel.tasks
-        )
-    end
 
     local html = [[
 <!doctype html>
@@ -747,7 +751,7 @@ quotaPanelHTML = function(data)
         letter-spacing: -.06em;
     }
 
-    .usage-card { padding: 17px 18px 14px; }
+    .usage-card { padding: 17px 18px 18px; }
 
     .section-head {
         display: flex;
@@ -792,12 +796,14 @@ quotaPanelHTML = function(data)
     .models {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 0 20px;
+        gap: 10px;
     }
 
     .model-row {
-        padding: 10px 0;
-        border-top: 1px solid var(--line);
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(255,255,255,.58);
     }
 
     .model-head {
@@ -836,7 +842,7 @@ quotaPanelHTML = function(data)
 
     .track {
         height: 4px;
-        margin: 8px 0 7px 16px;
+        margin: 8px 0 6px 16px;
         overflow: hidden;
         border-radius: 999px;
         background: #E5E8E6;
@@ -849,100 +855,184 @@ quotaPanelHTML = function(data)
         border-radius: inherit;
     }
 
-    .model-metrics {
-        display: flex;
-        gap: 12px;
+    .model-summary {
         margin-left: 16px;
         color: var(--muted);
         font-size: 9px;
         white-space: nowrap;
     }
 
-    .model-metrics b {
+    .efficiency-block {
+        margin-top: 10px;
+        padding: 9px 10px 8px;
+        border-radius: 10px;
+        background: rgba(241,242,238,.92);
+    }
+
+    .efficiency-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+
+    .efficiency-index {
+        display: flex;
+        align-items: baseline;
+        gap: 4px;
+    }
+
+    .efficiency-index b {
+        font-size: 17px;
+        letter-spacing: -.05em;
+    }
+
+    .efficiency-index span {
+        color: var(--muted);
+        font-size: 8px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+    }
+
+    .efficiency-verdict {
+        padding: 3px 6px;
+        border-radius: 6px;
+        font-size: 8px;
+        font-weight: 800;
+    }
+
+    .efficiency-verdict.good {
+        color: #187356;
+        background: var(--green-soft);
+    }
+
+    .efficiency-verdict.average {
+        color: #55615B;
+        background: #E3E7E4;
+    }
+
+    .efficiency-verdict.watch {
+        color: var(--amber);
+        background: var(--amber-soft);
+    }
+
+    .efficiency-verdict.sample {
+        color: #5F6690;
+        background: #E6E8F4;
+    }
+
+    .efficiency-track {
+        position: relative;
+        height: 4px;
+        margin: 7px 0 6px;
+        border-radius: 999px;
+        background: #DDE2DF;
+    }
+
+    .efficiency-track span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        opacity: .78;
+    }
+
+    .efficiency-track i {
+        position: absolute;
+        top: -2px;
+        left: 66.66%;
+        width: 2px;
+        height: 8px;
+        border-radius: 2px;
+        background: rgba(23,32,28,.45);
+    }
+
+    .efficiency-metrics {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 8px;
+    }
+
+    .efficiency-metrics b {
         color: var(--ink);
         font-weight: 700;
     }
 
     .insight {
         display: grid;
-        grid-template-columns: 1.2fr 1fr;
-        gap: 16px;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 14px;
         margin-top: 12px;
-        padding: 16px 18px;
-        border-color: rgba(169,101,24,.14);
-        background: linear-gradient(135deg, rgba(255,250,241,.94), rgba(255,255,255,.86));
+        padding: 13px 16px;
+        border-color: rgba(46,155,120,.14);
+        background: linear-gradient(135deg, rgba(245,252,248,.96), rgba(255,255,255,.86));
     }
 
-    .insight-copy h3 {
-        margin: 4px 0 5px;
-        font-size: 18px;
-        letter-spacing: -.035em;
-    }
-
-    .verdict {
-        display: inline-flex;
-        margin: 0;
-        padding: 5px 8px;
-        border-radius: 8px;
-        font-size: 10px;
+    .method-mark {
+        width: 48px;
+        height: 48px;
+        display: grid;
+        place-items: center;
+        border-radius: 15px;
+        color: white;
+        background: var(--green);
+        box-shadow: 0 8px 18px rgba(46,155,120,.22);
+        font-size: 17px;
         font-weight: 800;
+        letter-spacing: -.04em;
     }
 
-    .verdict.good {
+    .method-copy .eyebrow {
+        color: var(--green);
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: .12em;
+    }
+
+    .method-copy h3 {
+        margin: 3px 0 3px;
+        font-size: 13px;
+        letter-spacing: -.02em;
+    }
+
+    .method-copy p {
+        margin: 0;
+        max-width: 390px;
+        color: var(--muted);
+        font-size: 8px;
+        line-height: 1.4;
+    }
+
+    .method-scale {
+        display: grid;
+        gap: 4px;
+        justify-items: start;
+    }
+
+    .method-scale span {
+        padding: 3px 6px;
+        border-radius: 6px;
+        font-size: 8px;
+        font-weight: 800;
+        white-space: nowrap;
+    }
+
+    .scale-good {
         color: #187356;
         background: var(--green-soft);
     }
 
-    .verdict.watch {
+    .scale-average {
+        color: #55615B;
+        background: #E3E7E4;
+    }
+
+    .scale-watch {
         color: var(--amber);
         background: var(--amber-soft);
-    }
-
-    .explanation {
-        max-width: 390px;
-        margin: 8px 0 0;
-        color: var(--muted);
-        font-size: 9px;
-        line-height: 1.45;
-    }
-
-    .insight-stats {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        align-items: center;
-        overflow: hidden;
-        border: 1px solid var(--line);
-        border-radius: 13px;
-        background: rgba(255,255,255,.68);
-    }
-
-    .insight-stats div {
-        min-width: 0;
-        padding: 12px 9px;
-        text-align: center;
-        border-left: 1px solid var(--line);
-    }
-
-    .insight-stats div:first-child { border-left: 0; }
-
-    .insight-stats b {
-        display: block;
-        font-size: 14px;
-        letter-spacing: -.03em;
-    }
-
-    .insight-stats span {
-        display: block;
-        margin-top: 3px;
-        color: var(--muted);
-        font-size: 8px;
-        line-height: 1.25;
-    }
-
-    .empty-insight {
-        grid-column: 1 / -1;
-        color: var(--muted);
-        font-size: 12px;
     }
 
     @media (max-width: 620px) {
@@ -950,6 +1040,7 @@ quotaPanelHTML = function(data)
         .summary { grid-template-columns: 1fr 1fr; }
         .quota-card { grid-column: 1 / -1; }
         .models, .insight { grid-template-columns: 1fr; }
+        .method-scale { grid-template-columns: repeat(3, auto); }
     }
 </style>
 </head>
@@ -988,8 +1079,8 @@ quotaPanelHTML = function(data)
     <section class="card usage-card">
         <div class="section-head">
             <div>
-                <h2>Распределение нагрузки</h2>
-                <p>Доля сгенерированных токенов, Spark исключён</p>
+                <h2>Модели и эффективность</h2>
+                <p>Доля токенов и стоимость одной задачи, Spark исключён</p>
             </div>
             <span class="period">7 дней</span>
         </div>
