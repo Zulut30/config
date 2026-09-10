@@ -372,6 +372,7 @@ local efficiencyHistoryPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/e
 local efficiencyStatusPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/status.json"
 local modelQualityPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/model-quality.json"
 local modelQualityScriptPath = os.getenv("HOME") .. "/.hammerspoon/codex_model_quality.py"
+local modelFeedbackPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/model-feedback.json"
 
 local function readQuotaJSON(path)
     local file = io.open(path, "r")
@@ -400,6 +401,55 @@ local function writeQuotaJSON(path, value)
     file:close()
     return true
 end
+
+hs.urlevent.bind("codexQuotaFeedback", function(_, params)
+    local turnId = tostring(params.turn or "")
+    local model = tostring(params.model or "")
+    local verdict = tostring(params.verdict or "")
+    if turnId == "" or model == "" or (verdict ~= "good" and verdict ~= "rework") then
+        return
+    end
+
+    local feedback = readQuotaJSON(modelFeedbackPath) or {
+        version = 1,
+        records = {},
+    }
+    feedback.records = feedback.records or {}
+
+    local replaced = false
+    for _, record in ipairs(feedback.records) do
+        if record.turnId == turnId then
+            record.model = model
+            record.verdict = verdict
+            record.timestamp = os.time()
+            replaced = true
+            break
+        end
+    end
+
+    if not replaced then
+        table.insert(feedback.records, {
+            turnId = turnId,
+            model = model,
+            verdict = verdict,
+            timestamp = os.time(),
+        })
+    end
+
+    writeQuotaJSON(modelFeedbackPath, feedback)
+    hs.execute(string.format(
+        "/usr/bin/python3 %q >/dev/null 2>&1 &",
+        modelQualityScriptPath
+    ))
+    hs.alert.show(verdict == "good" and "Результат учтён" or "Переделка учтена")
+
+    hs.timer.doAfter(1.2, function()
+        local status = readQuotaJSON(efficiencyStatusPath)
+        if status and codexQuotaPanel then
+            codexQuotaPanel:html(quotaPanelHTML(status))
+        end
+    end)
+end)
 
 local function recordModelEfficiency(status)
     if type(status) ~= "table" or type(status.taskStats) ~= "table" then
@@ -518,6 +568,28 @@ quotaPanelHTML = function(data)
     local qualityByModel = {}
     for _, item in ipairs(modelQuality.models or {}) do
         qualityByModel[tostring(item.name or "")] = item
+    end
+
+    local bestModel = nil
+    local bestEconomy = nil
+    local bestSpeed = nil
+    for _, item in ipairs(modelQuality.models or {}) do
+        local confidence = tonumber(item.confidence) or 0
+        if confidence >= 25 then
+            if not bestModel or (tonumber(item.score) or 0) > (tonumber(bestModel.score) or 0) then
+                bestModel = item
+            end
+            if not bestEconomy
+                or (tonumber(item.efficiencyScore) or 0) > (tonumber(bestEconomy.efficiencyScore) or 0)
+            then
+                bestEconomy = item
+            end
+            if not bestSpeed
+                or (tonumber(item.speedScore) or 0) > (tonumber(bestSpeed.speedScore) or 0)
+            then
+                bestSpeed = item
+            end
+        end
     end
 
     local function clamp(value, minimum, maximum)
@@ -816,6 +888,81 @@ quotaPanelHTML = function(data)
     local trackingSince = efficiencyHistory.startedAt
         and os.date("%d.%m, %H:%M", tonumber(efficiencyHistory.startedAt))
         or "сейчас"
+
+    local recommendationHTML = [[
+        <div class="decision-empty">
+            Рекомендация появится после накопления нескольких задач.
+        </div>
+    ]]
+
+    if bestModel then
+        local latest = modelQuality.latestUnrated
+        local feedbackHTML = [[
+            <div class="feedback-done">
+                <span>Прямая оценка</span>
+                <b>Новых результатов для оценки нет</b>
+            </div>
+        ]]
+
+        if latest and latest.turnId and latest.model then
+            local taskTime = latest.startedAt
+                and os.date("%d.%m %H:%M", tonumber(latest.startedAt))
+                or ""
+            feedbackHTML = string.format([[
+                <div class="feedback-box">
+                    <div class="feedback-copy">
+                        <span>ОЦЕНИТЬ ПОСЛЕДНИЙ РЕЗУЛЬТАТ · %s · %s</span>
+                        <p>%s</p>
+                    </div>
+                    <div class="feedback-actions">
+                        <a class="feedback-good" href="hammerspoon://codexQuotaFeedback?turn=%s&amp;model=%s&amp;verdict=good">Подошло</a>
+                        <a class="feedback-rework" href="hammerspoon://codexQuotaFeedback?turn=%s&amp;model=%s&amp;verdict=rework">Нужна переделка</a>
+                    </div>
+                </div>
+            ]],
+                htmlEscape(tostring(latest.model)),
+                taskTime,
+                htmlEscape(tostring(latest.promptPreview or "Последняя задача")),
+                tostring(latest.turnId),
+                tostring(latest.model),
+                tostring(latest.turnId),
+                tostring(latest.model)
+            )
+        end
+
+        recommendationHTML = string.format([[
+            <div class="decision-main">
+                <span class="decision-eyebrow">ЛУЧШИЙ ВЫБОР ПО ТВОЕЙ ИСТОРИИ</span>
+                <div class="decision-title">
+                    <h2>%s</h2>
+                    <span>%d/100</span>
+                </div>
+                <p>Уверенность %d%% · %d задач за 30 дней</p>
+            </div>
+            <div class="decision-metrics">
+                <div><span>Результат</span><b>%d</b></div>
+                <div><span>Экономичность</span><b>%d</b></div>
+                <div><span>Скорость</span><b>%d</b></div>
+            </div>
+            <div class="decision-alternatives">
+                <span>Экономнее <b>%s</b></span>
+                <span>Быстрее <b>%s</b></span>
+            </div>
+            %s
+        ]],
+            htmlEscape(tostring(bestModel.name or "")),
+            tonumber(bestModel.score) or 0,
+            tonumber(bestModel.confidence) or 0,
+            tonumber(bestModel.tasks) or 0,
+            tonumber(bestModel.outcomeScore) or 0,
+            tonumber(bestModel.efficiencyScore) or 0,
+            tonumber(bestModel.speedScore) or 0,
+            htmlEscape(tostring(bestEconomy and bestEconomy.name or "—")),
+            htmlEscape(tostring(bestSpeed and bestSpeed.name or "—")),
+            feedbackHTML
+        )
+    end
+
     local efficiencyHTML = string.format([[
         <div class="method-mark">Q</div>
         <div class="method-copy">
@@ -1071,6 +1218,190 @@ quotaPanelHTML = function(data)
     }
 
     .usage-card { padding: 17px 18px 18px; }
+
+    .decision-card {
+        display: grid;
+        grid-template-columns: 1.15fr .82fr .72fr;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 12px;
+        padding: 17px 18px;
+        overflow: hidden;
+        color: white;
+        border: 0;
+        background:
+            radial-gradient(circle at 85% -30%, rgba(87,218,172,.28), transparent 42%),
+            linear-gradient(135deg, #17231E, #243B31);
+        box-shadow: 0 18px 40px rgba(23,35,30,.18);
+    }
+
+    .decision-eyebrow {
+        color: #78D9B5;
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: .12em;
+    }
+
+    .decision-title {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        margin: 4px 0;
+    }
+
+    .decision-title h2 {
+        min-width: 0;
+        margin: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 19px;
+        letter-spacing: -.035em;
+        white-space: nowrap;
+    }
+
+    .decision-title > span {
+        padding: 4px 7px;
+        border: 1px solid rgba(120,217,181,.25);
+        border-radius: 8px;
+        color: #8AE2C1;
+        background: rgba(120,217,181,.10);
+        font-size: 10px;
+        font-weight: 800;
+        white-space: nowrap;
+    }
+
+    .decision-main p {
+        margin: 0;
+        color: rgba(255,255,255,.56);
+        font-size: 9px;
+    }
+
+    .decision-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,.10);
+        border-radius: 12px;
+        background: rgba(255,255,255,.055);
+    }
+
+    .decision-metrics div {
+        padding: 9px 7px;
+        text-align: center;
+        border-left: 1px solid rgba(255,255,255,.09);
+    }
+
+    .decision-metrics div:first-child { border-left: 0; }
+
+    .decision-metrics span {
+        display: block;
+        color: rgba(255,255,255,.50);
+        font-size: 7px;
+    }
+
+    .decision-metrics b {
+        display: block;
+        margin-top: 2px;
+        font-size: 16px;
+        letter-spacing: -.04em;
+    }
+
+    .decision-alternatives {
+        display: grid;
+        gap: 5px;
+        color: rgba(255,255,255,.52);
+        font-size: 8px;
+    }
+
+    .decision-alternatives span {
+        padding: 5px 7px;
+        border-radius: 7px;
+        background: rgba(255,255,255,.055);
+    }
+
+    .decision-alternatives b {
+        display: block;
+        margin-top: 2px;
+        overflow: hidden;
+        color: white;
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .feedback-box {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: -4px;
+        padding-top: 11px;
+        border-top: 1px solid rgba(255,255,255,.10);
+    }
+
+    .feedback-copy {
+        min-width: 0;
+    }
+
+    .feedback-copy span,
+    .feedback-done span {
+        color: #78D9B5;
+        font-size: 7px;
+        font-weight: 800;
+        letter-spacing: .08em;
+    }
+
+    .feedback-copy p {
+        max-width: 480px;
+        margin: 3px 0 0;
+        overflow: hidden;
+        color: rgba(255,255,255,.74);
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .feedback-actions {
+        display: flex;
+        gap: 6px;
+        flex: 0 0 auto;
+    }
+
+    .feedback-actions a {
+        padding: 6px 9px;
+        border-radius: 8px;
+        color: white;
+        font-size: 8px;
+        font-weight: 800;
+        text-decoration: none;
+    }
+
+    .feedback-good { background: #2E9B78; }
+
+    .feedback-rework {
+        border: 1px solid rgba(255,255,255,.14);
+        background: rgba(255,255,255,.07);
+    }
+
+    .feedback-done {
+        grid-column: 1 / -1;
+        display: flex;
+        justify-content: space-between;
+        padding-top: 10px;
+        border-top: 1px solid rgba(255,255,255,.10);
+    }
+
+    .feedback-done b {
+        color: rgba(255,255,255,.70);
+        font-size: 8px;
+    }
+
+    .decision-empty {
+        grid-column: 1 / -1;
+        color: rgba(255,255,255,.70);
+        font-size: 11px;
+    }
 
     .section-head {
         display: flex;
@@ -1523,6 +1854,8 @@ quotaPanelHTML = function(data)
         .summary { grid-template-columns: 1fr 1fr; }
         .quota-card { grid-column: 1 / -1; }
         .models, .insight { grid-template-columns: 1fr; }
+        .decision-card { grid-template-columns: 1fr; }
+        .feedback-box { align-items: flex-start; flex-direction: column; }
         .method-scale { grid-template-columns: repeat(3, auto); }
     }
 </style>
@@ -1562,6 +1895,8 @@ quotaPanelHTML = function(data)
         </article>
     </section>
 
+    <section class="card decision-card">__RECOMMENDATION__</section>
+
     <section class="card usage-card">
         <div class="section-head">
             <div>
@@ -1593,6 +1928,7 @@ quotaPanelHTML = function(data)
     inject("__CREDITS__", resetCredits)
     inject("__SEGMENTS__", table.concat(compositionSegments))
     inject("__MODEL_ROWS__", table.concat(modelRows))
+    inject("__RECOMMENDATION__", recommendationHTML)
     inject("__EFFICIENCY__", efficiencyHTML)
 
     return html

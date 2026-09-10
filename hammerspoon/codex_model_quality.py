@@ -18,6 +18,7 @@ from typing import Any
 PERIOD_DAYS = 30
 SESSION_ROOT = Path.home() / ".codex" / "sessions"
 OUTPUT_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "model-quality.json"
+FEEDBACK_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "model-feedback.json"
 CUTOFF = time.time() - PERIOD_DAYS * 86400
 
 CORRECTION_RE = re.compile(
@@ -110,7 +111,9 @@ def new_turn(turn_id: str) -> dict[str, Any]:
         "commandFailures": 0,
         "tests": 0,
         "testFailures": 0,
+        "lastTestFailed": None,
         "fileChanges": 0,
+        "manualFeedback": False,
     }
 
 
@@ -258,6 +261,7 @@ def parse_sessions() -> list[dict[str, Any]]:
 
                     if TEST_RE.search(command):
                         turn["tests"] += 1
+                        turn["lastTestFailed"] = failed
                         if failed:
                             turn["testFailures"] += 1
                 elif item_type == "FileChange":
@@ -278,7 +282,25 @@ def parse_sessions() -> list[dict[str, Any]]:
     return result
 
 
-def enrich_outcomes(turns: list[dict[str, Any]]) -> None:
+def load_feedback() -> dict[str, str]:
+    try:
+        with FEEDBACK_PATH.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+    result = {}
+    for record in value.get("records", []) if isinstance(value, dict) else []:
+        if not isinstance(record, dict):
+            continue
+        turn_id = str(record.get("turnId") or "")
+        verdict = str(record.get("verdict") or "")
+        if turn_id and verdict in {"good", "rework"}:
+            result[turn_id] = verdict
+    return result
+
+
+def enrich_outcomes(turns: list[dict[str, Any]], feedback: dict[str, str]) -> None:
     by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for turn in turns:
         by_thread[turn["threadId"]].append(turn)
@@ -296,6 +318,13 @@ def enrich_outcomes(turns: list[dict[str, Any]]) -> None:
                 continue
             turn["feedbackKnown"] = True
             turn["needsRework"] = bool(CORRECTION_RE.search(following["prompt"]))
+
+    for turn in turns:
+        verdict = feedback.get(turn["turnId"])
+        if verdict:
+            turn["feedbackKnown"] = True
+            turn["needsRework"] = verdict == "rework"
+            turn["manualFeedback"] = True
 
 
 def complexity(turn: dict[str, Any]) -> float:
@@ -335,7 +364,7 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
         commands = sum(item["commands"] for item in items)
         command_failures = sum(item["commandFailures"] for item in items)
         tests = sum(item["tests"] for item in items)
-        test_failures = sum(item["testFailures"] for item in items)
+        validated_tasks = [item for item in items if item["lastTestFailed"] is not None]
         complexity_sum = sum(item["complexity"] for item in items)
         output_tokens = sum(item["outputTokens"] for item in items)
         active_seconds = sum(
@@ -352,7 +381,12 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
         tool_success_rate = (
             (commands - command_failures) / commands if commands else None
         )
-        validation_rate = (tests - test_failures) / tests if tests else None
+        validation_rate = (
+            sum(not item["lastTestFailed"] for item in validated_tasks)
+            / len(validated_tasks)
+            if validated_tasks
+            else None
+        )
 
         outcome_score = weighted_available(
             [
@@ -375,6 +409,8 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
                 "validationRate": validation_rate,
                 "commands": commands,
                 "tests": tests,
+                "validatedTasks": len(validated_tasks),
+                "manualRatings": sum(bool(item["manualFeedback"]) for item in items),
                 "outputTokens": output_tokens,
                 "activeSeconds": active_seconds,
                 "complexityUnits": complexity_sum,
@@ -416,13 +452,17 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
         feedback_coverage = (
             model["evaluatedTasks"] / model["tasks"] if model["tasks"] else 0
         )
+        manual_coverage = min(1.0, model["manualRatings"] / 5)
         signal_coverage = (
             (1 if model["commands"] else 0)
             + (1 if model["tests"] else 0)
             + (1 if model["evaluatedTasks"] else 0)
         ) / 3
         confidence = 100 * sample_confidence * (
-            0.45 + 0.35 * feedback_coverage + 0.20 * signal_coverage
+            0.35
+            + 0.30 * feedback_coverage
+            + 0.20 * signal_coverage
+            + 0.15 * manual_coverage
         )
         model["confidence"] = round(max(0, min(100, confidence)))
         model["outcomeScore"] = round(model["outcomeScore"])
@@ -443,6 +483,27 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
 
     raw_models.sort(key=lambda item: (-item["score"], -item["confidence"], item["name"]))
 
+    latest_unrated = None
+    candidates = [
+        turn
+        for turn in turns
+        if turn["completed"]
+        and turn["hasFinal"]
+        and not turn["manualFeedback"]
+        and (time.time() - (turn["startedAt"] or 0)) <= 7 * 86400
+    ]
+    if candidates:
+        latest = max(candidates, key=lambda item: item["startedAt"] or 0)
+        preview = re.sub(r"\s+", " ", latest["prompt"]).strip()
+        if len(preview) > 78:
+            preview = preview[:75].rstrip() + "..."
+        latest_unrated = {
+            "turnId": latest["turnId"],
+            "model": latest["model"],
+            "startedAt": int(latest["startedAt"] or 0),
+            "promptPreview": preview,
+        }
+
     return {
         "version": 1,
         "generatedAt": int(time.time()),
@@ -458,6 +519,7 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         },
         "models": raw_models,
+        "latestUnrated": latest_unrated,
     }
 
 
@@ -481,7 +543,7 @@ def atomic_write(value: dict[str, Any]) -> None:
 
 def main() -> None:
     turns = parse_sessions()
-    enrich_outcomes(turns)
+    enrich_outcomes(turns, load_feedback())
     atomic_write(aggregate(turns))
 
 
