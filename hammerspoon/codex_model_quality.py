@@ -22,6 +22,13 @@ FEEDBACK_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "model-feedb
 LEDGER_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "task-ledger.jsonl"
 CUTOFF = time.time() - PERIOD_DAYS * 86400
 
+# These weights are a relative local load proxy, not OpenAI billing or quota units.
+# Cached context is cheaper to reuse, while generated and reasoning tokens usually
+# represent more work than a fresh input token.
+CACHED_INPUT_WEIGHT = 0.20
+OUTPUT_TOKEN_WEIGHT = 1.50
+REASONING_TOKEN_WEIGHT = 2.50
+
 CORRECTION_RE = re.compile(
     r"(?:"
     r"\bне\s+работает\b|\bне\s+сработал[оа]?\b|\bвс[её]\s+ещ[её]\b|"
@@ -408,7 +415,52 @@ def complexity(turn: dict[str, Any]) -> float:
         "writing": 0.4,
         "general": 0.0,
     }.get(category_key, 0.0)
-    return max(1.0, 1.0 + prompt_weight + url_weight + path_weight + category_weight)
+    structure_weight = min(
+        1.5,
+        len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", turn["prompt"])) * 0.18
+        + len(re.findall(r"```", turn["prompt"])) * 0.15,
+    )
+    intent_weight = min(
+        1.5,
+        len(
+            re.findall(
+                r"\b(?:сделай|добавь|исправь|удали|проверь|сравни|найди|"
+                r"создай|запусти|реализуй|build|fix|add|remove|check|compare)\w*\b",
+                turn["prompt"],
+                re.IGNORECASE,
+            )
+        )
+        * 0.16,
+    )
+    return max(
+        1.0,
+        1.0
+        + prompt_weight
+        + url_weight
+        + path_weight
+        + category_weight
+        + structure_weight
+        + intent_weight,
+    )
+
+
+def effective_token_cost(turn: dict[str, Any]) -> float:
+    input_tokens = max(0, int(turn.get("inputTokens") or 0))
+    cached_tokens = min(input_tokens, max(0, int(turn.get("cachedInputTokens") or 0)))
+    reasoning_tokens = min(
+        max(0, int(turn.get("outputTokens") or 0)),
+        max(0, int(turn.get("reasoningTokens") or 0)),
+    )
+    visible_output_tokens = max(
+        0,
+        int(turn.get("outputTokens") or 0) - reasoning_tokens,
+    )
+    return (
+        (input_tokens - cached_tokens)
+        + cached_tokens * CACHED_INPUT_WEIGHT
+        + visible_output_tokens * OUTPUT_TOKEN_WEIGHT
+        + reasoning_tokens * REASONING_TOKEN_WEIGHT
+    )
 
 
 def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -422,7 +474,12 @@ def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         current = None
         previous = None
         for turn in thread_turns:
-            if current is None or not previous or not previous["needsRework"]:
+            if (
+                current is None
+                or not previous
+                or not previous["needsRework"]
+                or current["model"] != turn["model"]
+            ):
                 current = {
                     "chainId": turn["turnId"],
                     "threadId": thread_id,
@@ -447,6 +504,7 @@ def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             item["totalTokens"] or item["inputTokens"] + item["outputTokens"]
             for item in attempts
         )
+        chain["effectiveTokens"] = sum(effective_token_cost(item) for item in attempts)
         chain["cachedInputTokens"] = sum(item["cachedInputTokens"] for item in attempts)
         chain["reworkTokens"] = sum(
             item["totalTokens"] or item["inputTokens"] + item["outputTokens"]
@@ -457,6 +515,12 @@ def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for item in attempts
         )
         chain["complexity"] = attempts[0]["complexity"]
+        chain["tokensPerComplexity"] = chain["effectiveTokens"] / max(
+            1.0, chain["complexity"]
+        )
+        chain["secondsPerComplexity"] = chain["activeSeconds"] / max(
+            1.0, chain["complexity"]
+        )
         chain["manualFeedback"] = any(item["manualFeedback"] for item in attempts)
     return chains
 
@@ -481,10 +545,13 @@ def write_ledger(chains: list[dict[str, Any]]) -> None:
                     "attempts": chain["attempts"],
                     "accepted": chain["accepted"],
                     "totalTokens": chain["totalTokens"],
+                    "effectiveTokens": round(chain["effectiveTokens"], 1),
                     "cachedInputTokens": chain["cachedInputTokens"],
                     "reworkTokens": chain["reworkTokens"],
                     "activeSeconds": round(chain["activeSeconds"], 1),
                     "complexity": round(chain["complexity"], 2),
+                    "tokensPerComplexity": round(chain["tokensPerComplexity"], 1),
+                    "secondsPerComplexity": round(chain["secondsPerComplexity"], 1),
                     "manualFeedback": chain["manualFeedback"],
                 }
                 handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
@@ -503,6 +570,23 @@ def ratio_score(value: float, median: float) -> float:
     return max(0.0, min(100.0, 50.0 + 40.0 * math.log2(median / value)))
 
 
+def bayesian_rate(
+    successes: float,
+    observations: float,
+    prior_mean: float = 0.5,
+    prior_strength: float = 4.0,
+) -> float:
+    return (successes + prior_mean * prior_strength) / (
+        observations + prior_strength
+    )
+
+
+def comparable_score(index: float, samples: int) -> float:
+    raw = ratio_score(index, 1.0)
+    reliability = 1 - math.exp(-max(0, samples) / 6)
+    return 50.0 + (raw - 50.0) * reliability
+
+
 def weighted_available(parts: list[tuple[float | None, float]]) -> float:
     present = [(value, weight) for value, weight in parts if value is not None]
     if not present:
@@ -519,6 +603,29 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
     chains_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for chain in chains:
         chains_by_model[chain["model"]].append(chain)
+
+    accepted_by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for chain in chains:
+        if chain["accepted"] is True:
+            accepted_by_category[chain["category"]].append(chain)
+    category_token_baseline = {
+        category: statistics.median(
+            chain["tokensPerComplexity"]
+            for chain in items
+            if chain["tokensPerComplexity"] > 0
+        )
+        for category, items in accepted_by_category.items()
+        if any(chain["tokensPerComplexity"] > 0 for chain in items)
+    }
+    category_time_baseline = {
+        category: statistics.median(
+            chain["secondsPerComplexity"]
+            for chain in items
+            if chain["secondsPerComplexity"] > 0
+        )
+        for category, items in accepted_by_category.items()
+        if any(chain["secondsPerComplexity"] > 0 for chain in items)
+    }
 
     raw_models = []
     for model, items in grouped.items():
@@ -550,6 +657,22 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         first_pass_rate = (
             len(first_pass) / len(known_chains) if known_chains else None
         )
+        weighted_known = sum(
+            2.0 if chain["manualFeedback"] else 1.0 for chain in known_chains
+        )
+        weighted_accepted = sum(
+            (2.0 if chain["manualFeedback"] else 1.0)
+            for chain in known_chains
+            if chain["accepted"]
+        )
+        weighted_first_pass = sum(
+            (2.0 if chain["manualFeedback"] else 1.0)
+            for chain in known_chains
+            if chain["accepted"] and chain["attempts"] == 1
+        )
+        acceptance_rate = (
+            len(accepted_chains) / len(known_chains) if known_chains else None
+        )
         completion_rate = (
             sum(
                 bool(
@@ -574,19 +697,68 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
 
         outcome_score = weighted_available(
             [
-                (first_pass_rate * 100 if first_pass_rate is not None else None, 0.55),
-                (completion_rate * 100 if completion_rate is not None else None, 0.25),
-                (tool_success_rate * 100 if tool_success_rate is not None else None, 0.10),
-                (validation_rate * 100 if validation_rate is not None else None, 0.10),
+                (bayesian_rate(weighted_accepted, weighted_known) * 100, 0.45),
+                (bayesian_rate(weighted_first_pass, weighted_known) * 100, 0.25),
+                (
+                    bayesian_rate(
+                        completion_rate * tasks if completion_rate is not None else 0,
+                        tasks,
+                        prior_mean=0.8,
+                    )
+                    * 100,
+                    0.15,
+                ),
+                (
+                    bayesian_rate(
+                        commands - command_failures,
+                        commands,
+                        prior_mean=0.9,
+                    )
+                    * 100
+                    if commands
+                    else None,
+                    0.10,
+                ),
+                (
+                    bayesian_rate(
+                        sum(not item["lastTestFailed"] for item in validated_tasks),
+                        len(validated_tasks),
+                        prior_mean=0.8,
+                    )
+                    * 100
+                    if validated_tasks
+                    else None,
+                    0.05,
+                ),
             ]
         )
+
+        token_indices = [
+            chain["tokensPerComplexity"]
+            / category_token_baseline[chain["category"]]
+            for chain in accepted_chains
+            if chain["category"] in category_token_baseline
+            and chain["tokensPerComplexity"] > 0
+        ]
+        time_indices = [
+            chain["secondsPerComplexity"]
+            / category_time_baseline[chain["category"]]
+            for chain in accepted_chains
+            if chain["category"] in category_time_baseline
+            and chain["secondsPerComplexity"] > 0
+        ]
+        token_index = statistics.median(token_indices) if token_indices else 1.0
+        time_index = statistics.median(time_indices) if time_indices else 1.0
+        effective_tokens = sum(effective_token_cost(item) for item in items)
 
         raw_models.append(
             {
                 "name": model,
                 "tasks": tasks,
                 "evaluatedTasks": len(known_chains),
+                "acceptedResults": len(accepted_chains),
                 "firstPassRate": first_pass_rate,
+                "acceptanceRate": acceptance_rate,
                 "reworkRate": 1 - first_pass_rate if first_pass_rate is not None else None,
                 "completionRate": completion_rate,
                 "toolSuccessRate": tool_success_rate,
@@ -597,16 +769,19 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                 "manualRatings": sum(bool(item["manualFeedback"]) for item in items),
                 "outputTokens": output_tokens,
                 "totalTokens": total_tokens,
+                "effectiveTokens": round(effective_tokens),
                 "cachedInputTokens": cached_input_tokens,
                 "activeSeconds": active_seconds,
                 "complexityUnits": complexity_sum,
                 "tokensPerComplexity": (
-                    total_tokens / complexity_sum if complexity_sum else 0
+                    effective_tokens / complexity_sum if complexity_sum else 0
                 ),
                 "secondsPerComplexity": (
                     active_seconds / complexity_sum if complexity_sum else 0
                 ),
                 "outcomeScore": outcome_score,
+                "_tokenIndex": token_index,
+                "_timeIndex": time_index,
                 "tokensPerAcceptedResult": (
                     statistics.median(
                         chain["totalTokens"] for chain in accepted_chains
@@ -621,6 +796,13 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                     if accepted_chains
                     else 0
                 ),
+                "effectiveTokensPerAcceptedResult": (
+                    statistics.median(
+                        chain["effectiveTokens"] for chain in accepted_chains
+                    )
+                    if accepted_chains
+                    else 0
+                ),
                 "reworkTokenShare": (
                     sum(chain["reworkTokens"] for chain in model_chains)
                     / sum(chain["totalTokens"] for chain in model_chains)
@@ -630,29 +812,30 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
             }
         )
 
-    token_values = [
-        model["tokensPerAcceptedResult"]
-        for model in raw_models
-        if model["tokensPerAcceptedResult"] > 0
-    ]
-    time_values = [
-        model["secondsPerAcceptedResult"]
-        for model in raw_models
-        if model["secondsPerAcceptedResult"] > 0
-    ]
-    median_tokens = statistics.median(token_values) if token_values else 0
-    median_time = statistics.median(time_values) if time_values else 0
-
     for model in raw_models:
-        efficiency_score = ratio_score(model["tokensPerAcceptedResult"], median_tokens)
-        speed_score = ratio_score(model["secondsPerAcceptedResult"], median_time)
+        efficiency_score = comparable_score(
+            model["_tokenIndex"], model["acceptedResults"]
+        )
+        speed_score = comparable_score(
+            model["_timeIndex"], model["acceptedResults"]
+        )
         model["efficiencyScore"] = round(efficiency_score)
         model["speedScore"] = round(speed_score)
         model["score"] = round(
-            model["outcomeScore"] * 0.70
-            + efficiency_score * 0.20
-            + speed_score * 0.10
+            model["outcomeScore"] * 0.60
+            + efficiency_score * 0.25
+            + speed_score * 0.15
         )
+        model["normalizedTokenIndex"] = round(model["_tokenIndex"] * 100)
+        model["normalizedTimeIndex"] = round(model["_timeIndex"] * 100)
+        model["tokenSavingsPercent"] = round(
+            max(-200, min(80, (1 - model["_tokenIndex"]) * 100))
+        )
+        model["timeSavingsPercent"] = round(
+            max(-200, min(80, (1 - model["_timeIndex"]) * 100))
+        )
+        del model["_tokenIndex"]
+        del model["_timeIndex"]
 
         sample_confidence = 1 - math.exp(-model["tasks"] / 12)
         feedback_coverage = (
@@ -675,6 +858,7 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
 
         for key in (
             "firstPassRate",
+            "acceptanceRate",
             "reworkRate",
             "completionRate",
             "toolSuccessRate",
@@ -688,6 +872,9 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         model["complexityUnits"] = round(model["complexityUnits"], 1)
         model["tokensPerAcceptedResult"] = round(model["tokensPerAcceptedResult"])
         model["secondsPerAcceptedResult"] = round(model["secondsPerAcceptedResult"], 1)
+        model["effectiveTokensPerAcceptedResult"] = round(
+            model["effectiveTokensPerAcceptedResult"]
+        )
         model["reworkTokenShare"] = round(model["reworkTokenShare"] * 100)
 
     raw_models.sort(key=lambda item: (-item["score"], -item["confidence"], item["name"]))
@@ -786,17 +973,21 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         }
 
     return {
-        "version": 1,
+        "version": 2,
         "generatedAt": int(time.time()),
         "periodDays": PERIOD_DAYS,
         "methodology": {
-            "resultWeight": 70,
-            "efficiencyWeight": 20,
-            "speedWeight": 10,
-            "firstPassShareOfResult": 55,
+            "resultWeight": 60,
+            "efficiencyWeight": 25,
+            "speedWeight": 15,
+            "acceptanceShareOfResult": 45,
+            "firstPassShareOfResult": 25,
+            "comparison": "category-and-complexity-normalized",
+            "tokenMetric": "relative-effective-token-load",
             "note": (
-                "Automatic proxy score. Quality is inferred from completion, "
-                "follow-up corrections, command reliability and validations."
+                "Relative local score, not quota accounting. Quality uses accepted "
+                "outcomes; economy and speed compare similar task categories after "
+                "complexity normalization and small-sample shrinkage."
             ),
         },
         "models": raw_models,

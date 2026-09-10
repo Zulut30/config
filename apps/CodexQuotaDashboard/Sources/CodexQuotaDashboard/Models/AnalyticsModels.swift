@@ -30,20 +30,28 @@ struct ModelQuality: Decodable, Identifiable {
     let name: String
     let tasks: Int
     let evaluatedTasks: Int?
+    let acceptedResults: Int?
     let score: Int
     let confidence: Int
     let outcomeScore: Int?
     let efficiencyScore: Int?
     let speedScore: Int?
     let firstPassRate: Double?
+    let acceptanceRate: Double?
     let completionRate: Double?
     let toolSuccessRate: Double?
     let validationRate: Double?
     let totalTokens: Double?
+    let effectiveTokens: Double?
     let cachedInputTokens: Double?
     let tokensPerAcceptedResult: Double?
+    let effectiveTokensPerAcceptedResult: Double?
     let secondsPerAcceptedResult: Double?
     let reworkTokenShare: Double?
+    let normalizedTokenIndex: Double?
+    let normalizedTimeIndex: Double?
+    let tokenSavingsPercent: Double?
+    let timeSavingsPercent: Double?
 
     func score(for mode: RankingMode) -> Int {
         switch mode {
