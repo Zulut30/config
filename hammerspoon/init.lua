@@ -368,8 +368,150 @@ local function refreshCodexQuota()
 codexQuotaMenu:setClickCallback(showCodexQuotaPanel)
 
 -- Clean macOS-style dashboard. Keep data collection and menu bar behavior intact.
+local efficiencyHistoryPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/efficiency-history.json"
+local efficiencyStatusPath = os.getenv("HOME") .. "/Library/Caches/CodexQuota/status.json"
+
+local function readQuotaJSON(path)
+    local file = io.open(path, "r")
+    if not file then
+        return nil
+    end
+    local content = file:read("*a")
+    file:close()
+    local ok, value = pcall(hs.json.decode, content)
+    if ok and type(value) == "table" then
+        return value
+    end
+    return nil
+end
+
+local function writeQuotaJSON(path, value)
+    local encoded = hs.json.encode(value)
+    if not encoded then
+        return false
+    end
+    local file = io.open(path, "w")
+    if not file then
+        return false
+    end
+    file:write(encoded)
+    file:close()
+    return true
+end
+
+local function recordModelEfficiency(status)
+    if type(status) ~= "table" or type(status.taskStats) ~= "table" then
+        return
+    end
+
+    local timestamp = tonumber(status.updatedAt) or os.time()
+    local history = readQuotaJSON(efficiencyHistoryPath) or {
+        version = 1,
+        startedAt = timestamp,
+        days = {},
+        points = {},
+    }
+
+    history.days = history.days or {}
+    history.points = history.points or {}
+    history.startedAt = history.startedAt or timestamp
+
+    if history.lastSnapshot and tonumber(history.lastSnapshot.timestamp) == timestamp then
+        return
+    end
+
+    local currentModels = {}
+    local totalTokens = 0
+    local totalTasks = 0
+
+    for _, item in ipairs(status.taskStats) do
+        local name = tostring(item.model or "")
+        if name ~= "" and not string.find(string.lower(name), "spark", 1, true) then
+            local tokens = tonumber(item.outputTokens) or 0
+            local tasks = tonumber(item.completedTasks) or 0
+            local seconds = tonumber(item.activeSeconds) or 0
+            currentModels[name] = {
+                tokens = tokens,
+                tasks = tasks,
+                seconds = seconds,
+            }
+            totalTokens = totalTokens + tokens
+            totalTasks = totalTasks + tasks
+        end
+    end
+
+    local averagePerTask = totalTasks > 0 and totalTokens / totalTasks or 0
+    local pointModels = {}
+    for name, item in pairs(currentModels) do
+        local perTask = item.tasks > 0 and item.tokens / item.tasks or 0
+        local ratio = averagePerTask > 0 and perTask / averagePerTask or 0
+        pointModels[name] = {
+            index = ratio > 0 and math.floor((1 / ratio) * 100 + 0.5) or 0,
+            tokensPerTask = perTask,
+            tasksPerHour = item.seconds > 0 and item.tasks / (item.seconds / 3600) or 0,
+            tasks = item.tasks,
+        }
+    end
+
+    if history.lastSnapshot and type(history.lastSnapshot.models) == "table" then
+        local dayKey = os.date("%Y-%m-%d", timestamp)
+        local day = history.days[dayKey] or {
+            timestamp = timestamp,
+            models = {},
+        }
+        day.models = day.models or {}
+
+        for name, current in pairs(currentModels) do
+            local previous = history.lastSnapshot.models[name]
+            if previous then
+                local deltaTokens = current.tokens - (tonumber(previous.tokens) or 0)
+                local deltaTasks = current.tasks - (tonumber(previous.tasks) or 0)
+                local deltaSeconds = current.seconds - (tonumber(previous.seconds) or 0)
+
+                if deltaTokens >= 0 and deltaTasks >= 0 and deltaSeconds >= 0 then
+                    local modelDay = day.models[name] or {
+                        tokens = 0,
+                        tasks = 0,
+                        seconds = 0,
+                    }
+                    modelDay.tokens = modelDay.tokens + deltaTokens
+                    modelDay.tasks = modelDay.tasks + deltaTasks
+                    modelDay.seconds = modelDay.seconds + deltaSeconds
+                    day.models[name] = modelDay
+                end
+            end
+        end
+
+        history.days[dayKey] = day
+    end
+
+    table.insert(history.points, {
+        timestamp = timestamp,
+        models = pointModels,
+    })
+
+    while #history.points > 192 do
+        table.remove(history.points, 1)
+    end
+
+    local cutoff = os.time() - (30 * 86400)
+    for key, day in pairs(history.days) do
+        if (tonumber(day.timestamp) or 0) < cutoff then
+            history.days[key] = nil
+        end
+    end
+
+    history.lastSnapshot = {
+        timestamp = timestamp,
+        models = currentModels,
+    }
+    writeQuotaJSON(efficiencyHistoryPath, history)
+end
+
 quotaPanelHTML = function(data)
     data = data or {}
+    recordModelEfficiency(data)
+    local efficiencyHistory = readQuotaJSON(efficiencyHistoryPath) or {}
 
     local function clamp(value, minimum, maximum)
         value = tonumber(value) or 0
@@ -447,6 +589,79 @@ quotaPanelHTML = function(data)
     local compositionSegments = {}
     local averagePerTask = totalTasks > 0 and totalTokens / totalTasks or 0
 
+    local function buildSparkline(modelName, color, currentIndex)
+        local values = {}
+        for _, point in ipairs(efficiencyHistory.points or {}) do
+            local modelPoint = point.models and point.models[modelName]
+            local value = modelPoint and tonumber(modelPoint.index)
+            if value and value > 0 then
+                table.insert(values, value)
+            end
+        end
+
+        if #values == 0 then
+            table.insert(values, currentIndex)
+        end
+
+        while #values > 24 do
+            table.remove(values, 1)
+        end
+
+        local coordinates = {}
+        local lastX = 120
+        local lastY = 14
+        local count = #values
+
+        for index, value in ipairs(values) do
+            local x = count > 1 and ((index - 1) / (count - 1)) * 120 or 120
+            local normalized = (math.max(50, math.min(150, value)) - 50) / 100
+            local y = 26 - (normalized * 22)
+            table.insert(coordinates, string.format("%.1f,%.1f", x, y))
+            lastX = x
+            lastY = y
+        end
+
+        if count == 1 then
+            table.insert(coordinates, 1, string.format("0,%.1f", lastY))
+        end
+
+        local changeText = "сбор истории"
+        local changeClass = "flat"
+        if count > 1 then
+            local change = values[count] - values[1]
+            if change > 0 then
+                changeText = string.format("+%d п.", change)
+                changeClass = "up"
+            elseif change < 0 then
+                changeText = string.format("%d п.", change)
+                changeClass = "down"
+            else
+                changeText = "без изменений"
+            end
+        end
+
+        return string.format([[
+            <div class="history-line">
+                <div class="spark-wrap">
+                    <svg class="sparkline" viewBox="0 0 120 28" preserveAspectRatio="none" aria-label="История индекса эффективности">
+                        <line x1="0" y1="15" x2="120" y2="15"></line>
+                        <polyline points="%s" style="stroke:%s"></polyline>
+                        <circle cx="%.1f" cy="%.1f" r="2.4" style="fill:%s"></circle>
+                    </svg>
+                </div>
+                <span class="history-change %s">%s</span>
+            </div>
+        ]],
+            table.concat(coordinates, " "),
+            color,
+            lastX,
+            lastY,
+            color,
+            changeClass,
+            changeText
+        )
+    end
+
     for index, item in ipairs(models) do
         local share = totalTokens > 0 and math.floor((item.tokens / totalTokens) * 100 + 0.5) or 0
         local color = colors[((index - 1) % #colors) + 1]
@@ -470,6 +685,8 @@ quotaPanelHTML = function(data)
             verdictClass = "watch"
             verdict = string.format("на %d%% ресурсоёмче", difference)
         end
+
+        local sparklineHTML = buildSparkline(item.name, color, efficiencyIndex)
 
         table.insert(compositionSegments, string.format(
             '<span style="width:%d%%;background:%s" title="%s: %d%%"></span>',
@@ -502,6 +719,7 @@ quotaPanelHTML = function(data)
                         <span style="width:%.1f%%;background:%s"></span>
                         <i></i>
                     </div>
+                    %s
                     <div class="efficiency-metrics">
                         <span><b>%s</b> / задача</span>
                         <span><b>%.1f</b> задач / час</span>
@@ -522,24 +740,28 @@ quotaPanelHTML = function(data)
             verdict,
             meterWidth,
             color,
+            sparklineHTML,
             formatTokens(perTask),
             tasksPerHour
         ))
     end
 
-    local efficiencyHTML = [[
+    local trackingSince = efficiencyHistory.startedAt
+        and os.date("%d.%m, %H:%M", tonumber(efficiencyHistory.startedAt))
+        or "сейчас"
+    local efficiencyHTML = string.format([[
         <div class="method-mark">100</div>
         <div class="method-copy">
-            <span class="eyebrow">КАК ЧИТАТЬ ЭФФЕКТИВНОСТЬ</span>
-            <h3>Индекс сравнивает расход на задачу</h3>
-            <p>100 — твой средний уровень. Выше 100 модель тратит меньше токенов на задачу, ниже 100 — больше.</p>
+            <span class="eyebrow">ТРЕКЕР ЭФФЕКТИВНОСТИ ВКЛЮЧЁН</span>
+            <h3>История сохраняется автоматически</h3>
+            <p>Снимок каждые 15 минут, дневные приращения хранятся 30 дней. Наблюдение начато %s.</p>
         </div>
         <div class="method-scale">
             <span class="scale-good">110+ экономнее</span>
             <span class="scale-average">90–109 средне</span>
             <span class="scale-watch">&lt;90 ресурсоёмко</span>
         </div>
-    ]]
+    ]], trackingSince)
 
     local html = [[
 <!doctype html>
@@ -589,6 +811,36 @@ quotaPanelHTML = function(data)
         align-items: center;
         justify-content: space-between;
         margin-bottom: 14px;
+    }
+
+    .top-meta {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .tracking-live {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 4px 7px;
+        border: 1px solid rgba(46,155,120,.18);
+        border-radius: 999px;
+        color: #187356;
+        background: rgba(221,241,233,.78);
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+    }
+
+    .tracking-live::before {
+        content: "";
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 0 3px rgba(46,155,120,.12);
     }
 
     .brand {
@@ -947,6 +1199,58 @@ quotaPanelHTML = function(data)
         background: rgba(23,32,28,.45);
     }
 
+    .history-line {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 8px;
+        margin: 5px 0 3px;
+    }
+
+    .spark-wrap {
+        height: 24px;
+        overflow: hidden;
+        border-radius: 7px;
+        background:
+            linear-gradient(to bottom, transparent 49%, rgba(23,32,28,.05) 50%, transparent 51%);
+    }
+
+    .sparkline {
+        display: block;
+        width: 100%;
+        height: 24px;
+        overflow: visible;
+    }
+
+    .sparkline line {
+        stroke: rgba(23,32,28,.12);
+        stroke-width: 1;
+        stroke-dasharray: 3 3;
+    }
+
+    .sparkline polyline {
+        fill: none;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        vector-effect: non-scaling-stroke;
+    }
+
+    .history-change {
+        min-width: 62px;
+        padding: 3px 5px;
+        border-radius: 6px;
+        color: var(--muted);
+        background: rgba(255,255,255,.74);
+        font-size: 7px;
+        font-weight: 800;
+        text-align: center;
+        white-space: nowrap;
+    }
+
+    .history-change.up { color: #187356; }
+    .history-change.down { color: var(--amber); }
+
     .efficiency-metrics {
         display: flex;
         justify-content: space-between;
@@ -1048,7 +1352,10 @@ quotaPanelHTML = function(data)
 <main class="shell">
     <header class="topbar">
         <div class="brand"><span class="brand-mark">CQ</span> Codex Quota</div>
-        <div class="updated">Обновлено __UPDATED__</div>
+        <div class="top-meta">
+            <span class="tracking-live">история пишется</span>
+            <div class="updated">Обновлено __UPDATED__</div>
+        </div>
     </header>
 
     <section class="summary">
@@ -1111,6 +1418,18 @@ quotaPanelHTML = function(data)
 
     return html
 end
+
+local initialEfficiencyStatus = readQuotaJSON(efficiencyStatusPath)
+if initialEfficiencyStatus then
+    recordModelEfficiency(initialEfficiencyStatus)
+end
+
+codexQuotaEfficiencyTimer = hs.timer.doEvery(900, function()
+    local status = readQuotaJSON(efficiencyStatusPath)
+    if status then
+        recordModelEfficiency(status)
+    end
+end)
   else
     codexQuotaMenu:setTitle("--")
     codexQuotaMenu:setTooltip("Codex: ожидаю первое обновление лимита")
