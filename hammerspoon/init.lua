@@ -786,6 +786,8 @@ quotaPanelHTML = function(data)
             local toolSuccess = quality.toolSuccessRate ~= nil
                 and (tostring(math.floor(tonumber(quality.toolSuccessRate) or 0)) .. "%")
                 or "—"
+            local acceptedCost = tonumber(quality.tokensPerAcceptedResult) or 0
+            local reworkShare = tonumber(quality.reworkTokenShare) or 0
             local qualityClass = "quality-average"
             local qualityVerdict = "стабильно"
 
@@ -808,7 +810,8 @@ quotaPanelHTML = function(data)
                     </div>
                     <div class="quality-signals">
                         <span>С первой попытки <b>%s</b></span>
-                        <span>Команды <b>%s</b></span>
+                        <span>Принятый результат <b>%s</b></span>
+                        <span>Переделки <b>%d%%</b></span>
                     </div>
                     <div class="quality-state">
                         <b>%s</b>
@@ -819,7 +822,8 @@ quotaPanelHTML = function(data)
                 qualityClass,
                 score,
                 firstPass,
-                toolSuccess,
+                formatTokens(acceptedCost),
+                reworkShare,
                 qualityVerdict,
                 confidence
             )
@@ -941,7 +945,7 @@ quotaPanelHTML = function(data)
             </div>
             <div class="decision-metrics">
                 <div><span>Результат</span><b>%d</b></div>
-                <div><span>Экономичность</span><b>%d</b></div>
+                <div><span>Цена результата</span><b>%s</b></div>
                 <div><span>Скорость</span><b>%d</b></div>
             </div>
             <div class="decision-alternatives">
@@ -955,7 +959,7 @@ quotaPanelHTML = function(data)
             tonumber(bestModel.confidence) or 0,
             tonumber(bestModel.tasks) or 0,
             tonumber(bestModel.outcomeScore) or 0,
-            tonumber(bestModel.efficiencyScore) or 0,
+            formatTokens(tonumber(bestModel.tokensPerAcceptedResult) or 0),
             tonumber(bestModel.speedScore) or 0,
             htmlEscape(tostring(bestEconomy and bestEconomy.name or "—")),
             htmlEscape(tostring(bestSpeed and bestSpeed.name or "—")),
@@ -976,6 +980,31 @@ quotaPanelHTML = function(data)
             <span class="scale-watch">&lt;65 проверить</span>
         </div>
     ]], trackingSince)
+
+    local categoryCards = {}
+    for _, item in ipairs(modelQuality.categoryRecommendations or {}) do
+        table.insert(categoryCards, string.format([[
+            <article class="category-item">
+                <span>%s</span>
+                <strong>%s</strong>
+                <div>
+                    <b>%d/100</b>
+                    <small>%d%% уверенность · %s токенов</small>
+                </div>
+            </article>
+        ]],
+            htmlEscape(tostring(item.label or "")),
+            htmlEscape(tostring(item.model or "")),
+            tonumber(item.score) or 0,
+            tonumber(item.confidence) or 0,
+            formatTokens(tonumber(item.acceptedCost) or 0)
+        ))
+    end
+
+    local categoryHTML = table.concat(categoryCards)
+    if categoryHTML == "" then
+        categoryHTML = '<div class="category-empty">Категорий пока недостаточно для рекомендации.</div>'
+    end
 
     local html = [[
 <!doctype html>
@@ -1016,7 +1045,7 @@ quotaPanelHTML = function(data)
 
     .shell {
         width: 100%;
-        max-width: 760px;
+        max-width: 1120px;
         margin: 0 auto;
     }
 
@@ -1565,6 +1594,67 @@ quotaPanelHTML = function(data)
         font-size: 8px;
     }
 
+    .category-card {
+        margin-top: 12px;
+        padding: 16px 18px 18px;
+    }
+
+    .category-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 9px;
+        margin-top: 11px;
+    }
+
+    .category-item {
+        min-width: 0;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 13px;
+        background: rgba(255,255,255,.60);
+    }
+
+    .category-item > span {
+        display: block;
+        color: var(--muted);
+        font-size: 9px;
+        font-weight: 700;
+    }
+
+    .category-item > strong {
+        display: block;
+        margin: 4px 0 9px;
+        overflow: hidden;
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .category-item div {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 7px;
+    }
+
+    .category-item b {
+        color: var(--green);
+        font-size: 11px;
+    }
+
+    .category-item small {
+        overflow: hidden;
+        color: var(--muted);
+        font-size: 7px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .category-empty {
+        color: var(--muted);
+        font-size: 11px;
+    }
+
     .quality-signals b { color: var(--ink); }
 
     .quality-state {
@@ -1849,12 +1939,185 @@ quotaPanelHTML = function(data)
         background: var(--amber-soft);
     }
 
+    @media (min-width: 900px) {
+        body { padding: 28px; }
+
+        .topbar { margin-bottom: 18px; }
+
+        .brand {
+            gap: 11px;
+            font-size: 15px;
+        }
+
+        .brand-mark {
+            width: 28px;
+            height: 28px;
+            border-radius: 9px;
+            font-size: 12px;
+        }
+
+        .tracking-live {
+            padding: 6px 9px;
+            font-size: 9px;
+        }
+
+        .updated { font-size: 12px; }
+
+        .summary {
+            grid-template-columns: 1.45fr .9fr .55fr;
+            gap: 14px;
+            margin-bottom: 14px;
+        }
+
+        .card { border-radius: 21px; }
+
+        .quota-card {
+            min-height: 166px;
+            gap: 24px;
+            padding: 22px;
+        }
+
+        .gauge { --size: 118px; }
+
+        .gauge::after { inset: 12px; }
+
+        .gauge-value b { font-size: 34px; }
+
+        .gauge-value span { font-size: 10px; }
+
+        .quota-copy .eyebrow,
+        .insight-copy .eyebrow { font-size: 10px; }
+
+        .quota-copy h1 {
+            margin: 7px 0 8px;
+            font-size: 27px;
+        }
+
+        .quota-copy p { font-size: 14px; }
+
+        .mini-card {
+            min-height: 166px;
+            padding: 21px;
+        }
+
+        .mini-label { font-size: 11px; }
+
+        .mini-card strong { font-size: 20px; }
+
+        .mini-note { font-size: 12px; }
+
+        .credit strong { font-size: 45px; }
+
+        .decision-card {
+            gap: 22px;
+            margin-bottom: 14px;
+            padding: 21px 22px;
+        }
+
+        .decision-eyebrow { font-size: 9px; }
+
+        .decision-title h2 { font-size: 25px; }
+
+        .decision-title > span {
+            padding: 6px 9px;
+            font-size: 12px;
+        }
+
+        .decision-main p { font-size: 11px; }
+
+        .decision-metrics span { font-size: 9px; }
+
+        .decision-metrics b { font-size: 20px; }
+
+        .decision-alternatives { font-size: 10px; }
+
+        .decision-alternatives b { font-size: 11px; }
+
+        .feedback-copy span { font-size: 9px; }
+
+        .feedback-copy p { font-size: 11px; }
+
+        .feedback-actions a {
+            padding: 8px 12px;
+            font-size: 10px;
+        }
+
+        .usage-card,
+        .category-card { padding: 21px 22px; }
+
+        .section-head h2 { font-size: 19px; }
+
+        .section-head p,
+        .period { font-size: 11px; }
+
+        .models { gap: 14px; }
+
+        .model-row {
+            padding: 16px;
+            border-radius: 17px;
+        }
+
+        .model-name strong { font-size: 15px; }
+
+        .model-share { font-size: 14px; }
+
+        .model-summary { font-size: 11px; }
+
+        .quality-block { padding: 12px; }
+
+        .quality-label,
+        .quality-state span { font-size: 9px; }
+
+        .quality-score strong { font-size: 26px; }
+
+        .quality-signals { font-size: 10px; }
+
+        .quality-state b {
+            padding: 5px 8px;
+            font-size: 9px;
+        }
+
+        .efficiency-block { padding: 11px 12px; }
+
+        .efficiency-index b { font-size: 21px; }
+
+        .efficiency-index span,
+        .efficiency-metrics { font-size: 10px; }
+
+        .efficiency-verdict { font-size: 9px; }
+
+        .history-change { font-size: 9px; }
+
+        .category-grid {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .category-item { padding: 15px; }
+
+        .category-item > span { font-size: 11px; }
+
+        .category-item > strong { font-size: 15px; }
+
+        .category-item b { font-size: 13px; }
+
+        .category-item small { font-size: 9px; }
+
+        .insight { padding: 16px 20px; }
+
+        .method-copy h3 { font-size: 16px; }
+
+        .method-copy p,
+        .method-scale span { font-size: 10px; }
+    }
+
     @media (max-width: 620px) {
         body { padding: 14px; }
         .summary { grid-template-columns: 1fr 1fr; }
         .quota-card { grid-column: 1 / -1; }
         .models, .insight { grid-template-columns: 1fr; }
         .decision-card { grid-template-columns: 1fr; }
+        .category-grid { grid-template-columns: 1fr; }
         .feedback-box { align-items: flex-start; flex-direction: column; }
         .method-scale { grid-template-columns: repeat(3, auto); }
     }
@@ -1909,6 +2172,17 @@ quotaPanelHTML = function(data)
         <div class="models">__MODEL_ROWS__</div>
     </section>
 
+    <section class="card category-card">
+        <div class="section-head">
+            <div>
+                <h2>Какая модель выгоднее для задачи</h2>
+                <p>Рекомендации строятся отдельно по категориям</p>
+            </div>
+            <span class="period">30 дней</span>
+        </div>
+        <div class="category-grid">__CATEGORY_CARDS__</div>
+    </section>
+
     <section class="card insight">__EFFICIENCY__</section>
 </main>
 </body>
@@ -1929,6 +2203,7 @@ quotaPanelHTML = function(data)
     inject("__SEGMENTS__", table.concat(compositionSegments))
     inject("__MODEL_ROWS__", table.concat(modelRows))
     inject("__RECOMMENDATION__", recommendationHTML)
+    inject("__CATEGORY_CARDS__", categoryHTML)
     inject("__EFFICIENCY__", efficiencyHTML)
 
     return html
@@ -1956,6 +2231,34 @@ end
 
 refreshModelQuality()
 codexModelQualityTimer = hs.timer.doEvery(1800, refreshModelQuality)
+
+function showCodexQuotaPanel()
+    local screen = hs.screen.mainScreen():frame()
+    local panelWidth = math.min(1180, screen.w - 80)
+    local panelHeight = math.min(780, screen.h - 80)
+    local frame = {
+        x = screen.x + math.floor((screen.w - panelWidth) / 2),
+        y = screen.y + math.floor((screen.h - panelHeight) / 2),
+        w = panelWidth,
+        h = panelHeight,
+    }
+    local status = readQuotaJSON(efficiencyStatusPath) or {}
+
+    if not codexQuotaPanel then
+        codexQuotaPanel = hs.webview.newBrowser(frame, { privateBrowsing = true })
+            :allowNewWindows(false)
+            :closeOnEscape(true)
+            :windowTitle("Codex Quota")
+            :shadow(true)
+    else
+        codexQuotaPanel:frame(frame)
+    end
+
+    codexQuotaPanel:html(quotaPanelHTML(status))
+    codexQuotaPanel:show()
+end
+
+codexQuotaMenu:setClickCallback(showCodexQuotaPanel)
   else
     codexQuotaMenu:setTitle("--")
     codexQuotaMenu:setTooltip("Codex: ожидаю первое обновление лимита")

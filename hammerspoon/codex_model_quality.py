@@ -19,6 +19,7 @@ PERIOD_DAYS = 30
 SESSION_ROOT = Path.home() / ".codex" / "sessions"
 OUTPUT_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "model-quality.json"
 FEEDBACK_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "model-feedback.json"
+LEDGER_PATH = Path.home() / "Library" / "Caches" / "CodexQuota" / "task-ledger.jsonl"
 CUTOFF = time.time() - PERIOD_DAYS * 86400
 
 CORRECTION_RE = re.compile(
@@ -107,6 +108,9 @@ def new_turn(turn_id: str) -> dict[str, Any]:
         "hasFinal": False,
         "outputTokens": 0,
         "inputTokens": 0,
+        "cachedInputTokens": 0,
+        "reasoningTokens": 0,
+        "totalTokens": 0,
         "commands": 0,
         "commandFailures": 0,
         "tests": 0,
@@ -228,6 +232,24 @@ def parse_sessions() -> list[dict[str, Any]]:
                             turn["inputTokens"],
                             int(usage.get("input_tokens") or 0),
                         )
+                        turn["cachedInputTokens"] = max(
+                            turn["cachedInputTokens"],
+                            int(usage.get("cached_input_tokens") or 0),
+                        )
+                        turn["reasoningTokens"] = max(
+                            turn["reasoningTokens"],
+                            int(usage.get("reasoning_output_tokens") or 0),
+                        )
+                        turn["totalTokens"] = max(
+                            turn["totalTokens"],
+                            int(
+                                usage.get("total_tokens")
+                                or (
+                                    int(usage.get("input_tokens") or 0)
+                                    + int(usage.get("output_tokens") or 0)
+                                )
+                            ),
+                        )
                     continue
 
                 if event_type != "event_msg":
@@ -327,13 +349,152 @@ def enrich_outcomes(turns: list[dict[str, Any]], feedback: dict[str, str]) -> No
             turn["manualFeedback"] = True
 
 
+def classify_category(prompt: str) -> tuple[str, str]:
+    lowered = prompt.lower()
+    categories = (
+        (
+            "frontend",
+            "Frontend и дизайн",
+            r"frontend|фронтенд|интерфейс|ui\b|ux\b|дизайн|css\b|swiftui|дашборд|панел",
+        ),
+        (
+            "research",
+            "Исследования",
+            r"исслед|поищи|найди данные|источник|research|проанализируй|сравни",
+        ),
+        (
+            "writing",
+            "Тексты и редактура",
+            r"отредакт|статья|текст|перепиши|гайд|лонгрид|публикац|редактор",
+        ),
+        (
+            "macos",
+            "macOS и автоматизация",
+            r"macos|мак\b|hammerspoon|терминал|горяч|автозапуск|menu bar|dock",
+        ),
+        (
+            "documents",
+            "Документы",
+            r"pdf\b|docx\b|xlsx\b|таблиц|презентац|документ|google docs",
+        ),
+        (
+            "coding",
+            "Программирование",
+            r"код\b|баг\b|ошибк|репозитор|commit|push|api\b|swift\b|python\b|"
+            r"typescript|javascript|тест|файл|реализ",
+        ),
+    )
+    for key, label, pattern in categories:
+        if re.search(pattern, lowered):
+            return key, label
+    return "general", "Общие задачи"
+
+
 def complexity(turn: dict[str, Any]) -> float:
     prompt_chars = len(turn["prompt"])
-    prompt_weight = min(2.5, math.log2(1 + prompt_chars / 140))
-    tool_weight = min(2.5, turn["commands"] * 0.22)
-    change_weight = min(2.0, turn["fileChanges"] * 0.45)
-    validation_weight = min(1.0, turn["tests"] * 0.35)
-    return max(1.0, 1.0 + prompt_weight + tool_weight + change_weight + validation_weight)
+    prompt_weight = min(3.0, math.log2(1 + prompt_chars / 140))
+    url_weight = min(1.0, len(re.findall(r"https?://", turn["prompt"])) * 0.25)
+    path_weight = min(
+        1.5,
+        len(re.findall(r"(?:^|\s)(?:/|\./|\.\./)[^\s]+", turn["prompt"])) * 0.3,
+    )
+    category_key, _ = classify_category(turn["prompt"])
+    category_weight = {
+        "research": 1.2,
+        "frontend": 0.8,
+        "coding": 0.9,
+        "documents": 0.7,
+        "macos": 0.6,
+        "writing": 0.4,
+        "general": 0.0,
+    }.get(category_key, 0.0)
+    return max(1.0, 1.0 + prompt_weight + url_weight + path_weight + category_weight)
+
+
+def build_chains(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for turn in turns:
+        by_thread[turn["threadId"]].append(turn)
+
+    chains = []
+    for thread_id, thread_turns in by_thread.items():
+        thread_turns.sort(key=lambda item: item["startedAt"] or 0)
+        current = None
+        previous = None
+        for turn in thread_turns:
+            if current is None or not previous or not previous["needsRework"]:
+                current = {
+                    "chainId": turn["turnId"],
+                    "threadId": thread_id,
+                    "model": turn["model"],
+                    "category": turn["category"],
+                    "categoryLabel": turn["categoryLabel"],
+                    "startedAt": turn["startedAt"],
+                    "turns": [],
+                }
+                chains.append(current)
+            current["turns"].append(turn)
+            previous = turn
+
+    for chain in chains:
+        attempts = chain["turns"]
+        last = attempts[-1]
+        chain["accepted"] = (
+            not last["needsRework"] if last["feedbackKnown"] else None
+        )
+        chain["attempts"] = len(attempts)
+        chain["totalTokens"] = sum(
+            item["totalTokens"] or item["inputTokens"] + item["outputTokens"]
+            for item in attempts
+        )
+        chain["cachedInputTokens"] = sum(item["cachedInputTokens"] for item in attempts)
+        chain["reworkTokens"] = sum(
+            item["totalTokens"] or item["inputTokens"] + item["outputTokens"]
+            for item in attempts[1:]
+        )
+        chain["activeSeconds"] = sum(
+            max(0.0, (item["endedAt"] or 0) - (item["startedAt"] or 0))
+            for item in attempts
+        )
+        chain["complexity"] = attempts[0]["complexity"]
+        chain["manualFeedback"] = any(item["manualFeedback"] for item in attempts)
+    return chains
+
+
+def write_ledger(chains: list[dict[str, Any]]) -> None:
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="task-ledger-",
+        suffix=".jsonl",
+        dir=LEDGER_PATH.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for chain in sorted(chains, key=lambda item: item["startedAt"] or 0):
+                record = {
+                    "chainId": chain["chainId"],
+                    "threadId": chain["threadId"],
+                    "model": chain["model"],
+                    "category": chain["category"],
+                    "categoryLabel": chain["categoryLabel"],
+                    "startedAt": int(chain["startedAt"] or 0),
+                    "attempts": chain["attempts"],
+                    "accepted": chain["accepted"],
+                    "totalTokens": chain["totalTokens"],
+                    "cachedInputTokens": chain["cachedInputTokens"],
+                    "reworkTokens": chain["reworkTokens"],
+                    "activeSeconds": round(chain["activeSeconds"], 1),
+                    "complexity": round(chain["complexity"], 2),
+                    "manualFeedback": chain["manualFeedback"],
+                }
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+        os.replace(temporary, LEDGER_PATH)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def ratio_score(value: float, median: float) -> float:
@@ -350,31 +511,54 @@ def weighted_available(parts: list[tuple[float | None, float]]) -> float:
     return sum(float(value) * weight for value, weight in present) / weight_sum
 
 
-def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for turn in turns:
-        turn["complexity"] = complexity(turn)
         grouped[turn["model"]].append(turn)
+
+    chains_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for chain in chains:
+        chains_by_model[chain["model"]].append(chain)
 
     raw_models = []
     for model, items in grouped.items():
-        tasks = len(items)
-        feedback = [item for item in items if item["feedbackKnown"]]
-        first_pass = [item for item in feedback if not item["needsRework"]]
+        model_chains = chains_by_model.get(model, [])
+        tasks = len(model_chains)
+        known_chains = [chain for chain in model_chains if chain["accepted"] is not None]
+        first_pass = [
+            chain
+            for chain in known_chains
+            if chain["accepted"] and chain["attempts"] == 1
+        ]
+        accepted_chains = [chain for chain in model_chains if chain["accepted"] is True]
         commands = sum(item["commands"] for item in items)
         command_failures = sum(item["commandFailures"] for item in items)
         tests = sum(item["tests"] for item in items)
         validated_tasks = [item for item in items if item["lastTestFailed"] is not None]
         complexity_sum = sum(item["complexity"] for item in items)
         output_tokens = sum(item["outputTokens"] for item in items)
+        total_tokens = sum(
+            item["totalTokens"] or item["inputTokens"] + item["outputTokens"]
+            for item in items
+        )
+        cached_input_tokens = sum(item["cachedInputTokens"] for item in items)
         active_seconds = sum(
             max(0.0, (item["endedAt"] or 0) - (item["startedAt"] or 0))
             for item in items
         )
 
-        first_pass_rate = len(first_pass) / len(feedback) if feedback else None
+        first_pass_rate = (
+            len(first_pass) / len(known_chains) if known_chains else None
+        )
         completion_rate = (
-            sum(bool(item["completed"] and item["hasFinal"]) for item in items) / tasks
+            sum(
+                bool(
+                    chain["turns"][-1]["completed"]
+                    and chain["turns"][-1]["hasFinal"]
+                )
+                for chain in model_chains
+            )
+            / tasks
             if tasks
             else None
         )
@@ -401,7 +585,7 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
             {
                 "name": model,
                 "tasks": tasks,
-                "evaluatedTasks": len(feedback),
+                "evaluatedTasks": len(known_chains),
                 "firstPassRate": first_pass_rate,
                 "reworkRate": 1 - first_pass_rate if first_pass_rate is not None else None,
                 "completionRate": completion_rate,
@@ -412,34 +596,56 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
                 "validatedTasks": len(validated_tasks),
                 "manualRatings": sum(bool(item["manualFeedback"]) for item in items),
                 "outputTokens": output_tokens,
+                "totalTokens": total_tokens,
+                "cachedInputTokens": cached_input_tokens,
                 "activeSeconds": active_seconds,
                 "complexityUnits": complexity_sum,
                 "tokensPerComplexity": (
-                    output_tokens / complexity_sum if complexity_sum else 0
+                    total_tokens / complexity_sum if complexity_sum else 0
                 ),
                 "secondsPerComplexity": (
                     active_seconds / complexity_sum if complexity_sum else 0
                 ),
                 "outcomeScore": outcome_score,
+                "tokensPerAcceptedResult": (
+                    statistics.median(
+                        chain["totalTokens"] for chain in accepted_chains
+                    )
+                    if accepted_chains
+                    else 0
+                ),
+                "secondsPerAcceptedResult": (
+                    statistics.median(
+                        chain["activeSeconds"] for chain in accepted_chains
+                    )
+                    if accepted_chains
+                    else 0
+                ),
+                "reworkTokenShare": (
+                    sum(chain["reworkTokens"] for chain in model_chains)
+                    / sum(chain["totalTokens"] for chain in model_chains)
+                    if sum(chain["totalTokens"] for chain in model_chains) > 0
+                    else 0
+                ),
             }
         )
 
     token_values = [
-        model["tokensPerComplexity"]
+        model["tokensPerAcceptedResult"]
         for model in raw_models
-        if model["tokensPerComplexity"] > 0
+        if model["tokensPerAcceptedResult"] > 0
     ]
     time_values = [
-        model["secondsPerComplexity"]
+        model["secondsPerAcceptedResult"]
         for model in raw_models
-        if model["secondsPerComplexity"] > 0
+        if model["secondsPerAcceptedResult"] > 0
     ]
     median_tokens = statistics.median(token_values) if token_values else 0
     median_time = statistics.median(time_values) if time_values else 0
 
     for model in raw_models:
-        efficiency_score = ratio_score(model["tokensPerComplexity"], median_tokens)
-        speed_score = ratio_score(model["secondsPerComplexity"], median_time)
+        efficiency_score = ratio_score(model["tokensPerAcceptedResult"], median_tokens)
+        speed_score = ratio_score(model["secondsPerAcceptedResult"], median_time)
         model["efficiencyScore"] = round(efficiency_score)
         model["speedScore"] = round(speed_score)
         model["score"] = round(
@@ -480,8 +686,83 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
         model["tokensPerComplexity"] = round(model["tokensPerComplexity"], 1)
         model["secondsPerComplexity"] = round(model["secondsPerComplexity"], 1)
         model["complexityUnits"] = round(model["complexityUnits"], 1)
+        model["tokensPerAcceptedResult"] = round(model["tokensPerAcceptedResult"])
+        model["secondsPerAcceptedResult"] = round(model["secondsPerAcceptedResult"], 1)
+        model["reworkTokenShare"] = round(model["reworkTokenShare"] * 100)
 
     raw_models.sort(key=lambda item: (-item["score"], -item["confidence"], item["name"]))
+
+    category_recommendations = []
+    category_groups: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for chain in chains:
+        category_groups[chain["category"]][chain["model"]].append(chain)
+
+    for category, model_groups in category_groups.items():
+        candidates = []
+        for model, model_chains in model_groups.items():
+            known = [chain for chain in model_chains if chain["accepted"] is not None]
+            accepted = [chain for chain in model_chains if chain["accepted"] is True]
+            if not known or not accepted:
+                continue
+            first_pass_count = sum(
+                chain["accepted"] and chain["attempts"] == 1 for chain in known
+            )
+            candidates.append(
+                {
+                    "model": model,
+                    "tasks": len(model_chains),
+                    "known": len(known),
+                    "successProbability": (first_pass_count + 2) / (len(known) + 4),
+                    "acceptedCost": statistics.median(
+                        chain["totalTokens"] for chain in accepted
+                    ),
+                    "acceptedSeconds": statistics.median(
+                        chain["activeSeconds"] for chain in accepted
+                    ),
+                }
+            )
+
+        if not candidates:
+            continue
+        category_cost_median = statistics.median(
+            item["acceptedCost"] for item in candidates
+        )
+        category_time_median = statistics.median(
+            item["acceptedSeconds"] for item in candidates
+        )
+        for item in candidates:
+            item["score"] = round(
+                item["successProbability"] * 70
+                + ratio_score(item["acceptedCost"], category_cost_median) * 0.20
+                + ratio_score(item["acceptedSeconds"], category_time_median) * 0.10
+            )
+            item["confidence"] = round(100 * (1 - math.exp(-item["known"] / 8)))
+        best = max(candidates, key=lambda item: (item["score"], item["confidence"]))
+        label = next(
+            (
+                chain["categoryLabel"]
+                for chain in chains
+                if chain["category"] == category
+            ),
+            category,
+        )
+        category_recommendations.append(
+            {
+                "category": category,
+                "label": label,
+                "model": best["model"],
+                "score": best["score"],
+                "confidence": best["confidence"],
+                "tasks": best["tasks"],
+                "acceptedCost": round(best["acceptedCost"]),
+            }
+        )
+
+    category_recommendations.sort(
+        key=lambda item: (-item["confidence"], item["label"])
+    )
 
     latest_unrated = None
     candidates = [
@@ -519,6 +800,7 @@ def aggregate(turns: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         },
         "models": raw_models,
+        "categoryRecommendations": category_recommendations,
         "latestUnrated": latest_unrated,
     }
 
@@ -544,7 +826,12 @@ def atomic_write(value: dict[str, Any]) -> None:
 def main() -> None:
     turns = parse_sessions()
     enrich_outcomes(turns, load_feedback())
-    atomic_write(aggregate(turns))
+    for turn in turns:
+        turn["complexity"] = complexity(turn)
+        turn["category"], turn["categoryLabel"] = classify_category(turn["prompt"])
+    chains = build_chains(turns)
+    write_ledger(chains)
+    atomic_write(aggregate(turns, chains))
 
 
 if __name__ == "__main__":
