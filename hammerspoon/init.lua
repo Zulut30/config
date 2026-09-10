@@ -103,20 +103,24 @@ local function isSparkModel(name)
   return name == "gpt-5.3-codex-spark" or name == "GPT-5.3-Codex-Spark"
 end
 
-local function rankedTaskStats(stats)
+local function visibleTaskStats(stats)
   local ranked = {}
-  for index, stat in ipairs(stats) do
-    ranked[index] = stat
+  local totalTokens = 0
+  local totalTasks = 0
+  for _, stat in ipairs(stats) do
+    if stat.model ~= "gpt-5.3-codex-spark" and stat.model ~= "GPT-5.3-Codex-Spark" then
+      table.insert(ranked, stat)
+      totalTokens = totalTokens + (stat.outputTokens or 0)
+      totalTasks = totalTasks + (stat.completedTasks or 0)
+    end
   end
   table.sort(ranked, function(a, b)
-    local aShare = a.loadSharePercent or 0
-    local bShare = b.loadSharePercent or 0
-    if aShare == bShare then
+    if (a.outputTokens or 0) == (b.outputTokens or 0) then
       return (a.activeSeconds or 0) > (b.activeSeconds or 0)
     end
-    return aShare > bShare
+    return (a.outputTokens or 0) > (b.outputTokens or 0)
   end)
-  return ranked
+  return ranked, totalTokens, totalTasks
 end
 
 local function openCodexQuotaDashboard()
@@ -133,41 +137,43 @@ local function refreshCodexQuota()
     local remaining = math.max(0, math.min(100, tonumber(quota.remainingPercent) or 0))
     local percent = tostring(remaining) .. "%"
     local items = {
-      {title = "Открыть панель Codex Quota", fn = openCodexQuotaDashboard},
+      {title = "Открыть полную панель Codex Quota", fn = openCodexQuotaDashboard},
       {title = "-"},
       infoItem("НЕДЕЛЬНЫЙ ЛИМИТ CODEX"),
       infoItem(percent .. " осталось  ·  " .. tostring(100 - remaining) .. "% использовано"),
-      infoItem("Сброс: " .. resetText(quota.primaryResetAt)),
-      infoItem("Ручные сбросы: " .. tostring(quota.resetCreditCount or 0)),
+      infoItem("Сброс: " .. resetText(quota.primaryResetAt) .. "  ·  Ручных: " .. tostring(quota.resetCreditCount or 0)),
       {title = "-"},
-      infoItem("КУДА УХОДИТ НАГРУЗКА"),
-      infoItem("Доля по сгенерированным токенам за 7 дней"),
+      infoItem("РАСХОД ЗА 7 ДНЕЙ"),
+      infoItem("Доля по сгенерированным токенам, Spark скрыт"),
     }
 
-    local taskStats = rankedTaskStats(quota.taskStats or {})
+    local taskStats, totalTokens, totalTasks = visibleTaskStats(quota.taskStats or {})
     if #taskStats == 0 then
       table.insert(items, infoItem("Данные о задачах ещё собираются"))
     end
     for _, stat in ipairs(taskStats) do
-      if not isSparkModel(stat.model) then
-        table.insert(items, infoItem(friendlyModelName(stat.model) .. ": ~" .. tostring(stat.loadSharePercent or 0) .. "%  ·  " .. tokenText(stat.outputTokens or 0) .. " токенов"))
-        table.insert(items, infoItem("  " .. tostring(stat.completedTasks) .. " задач  ·  " .. durationText(stat.activeSeconds or 0)))
+      local share = totalTokens > 0 and math.floor(((stat.outputTokens or 0) / totalTokens) * 100 + 0.5) or 0
+      table.insert(items, infoItem(
+        friendlyModelName(stat.model)
+          .. "  " .. tostring(share) .. "%"
+          .. "  ·  " .. tokenText(stat.outputTokens or 0)
+          .. "  ·  " .. tostring(stat.completedTasks or 0) .. " задач"
+          .. "  ·  " .. durationText(stat.activeSeconds or 0)
+      ))
+    end
+
+    for _, stat in ipairs(taskStats) do
+      if stat.model == "gpt-6-astra" and (stat.completedTasks or 0) > 0 and totalTasks > 0 then
+        local astraPerTask = (stat.outputTokens or 0) / stat.completedTasks
+        local averagePerTask = totalTokens / totalTasks
+        local ratio = averagePerTask > 0 and astraPerTask / averagePerTask or 0
+        table.insert(items, {title = "-"})
+        table.insert(items, infoItem("ASTRA: " .. tokenText(astraPerTask) .. " на задачу  ·  " .. string.format("%.1fx", ratio) .. " от среднего"))
       end
     end
 
-    table.insert(items, {title = "-"})
-    table.insert(items, infoItem("ЛИМИТЫ ПО ОКНАМ"))
-
-    for _, model in ipairs(quota.models or {}) do
-      if not isSparkModel(model.name) then
-        if model.weeklyUsedPercent then
-          table.insert(items, infoItem(friendlyModelName(model.name) .. ": " .. tostring(model.weeklyUsedPercent) .. "% использовано за неделю"))
-          table.insert(items, infoItem("  Сброс: " .. resetText(model.weeklyResetAt)))
-        end
-        if model.shortUsedPercent then
-          table.insert(items, infoItem(friendlyModelName(model.name) .. ": " .. tostring(model.shortUsedPercent) .. "% использовано за " .. tostring(math.floor((model.shortDurationMinutes or 0) / 60)) .. " ч."))
-        end
-      end
+    if quota.updatedAt then
+      table.insert(items, infoItem("Обновлено: " .. os.date("%d.%m %H:%M", quota.updatedAt)))
     end
 
     codexQuotaMenu:setTitle(percent)
