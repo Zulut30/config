@@ -823,7 +823,36 @@ def atomic_write(value: dict[str, Any]) -> None:
             pass
 
 
+def sources_changed() -> bool:
+    if not OUTPUT_PATH.exists() or not LEDGER_PATH.exists():
+        return True
+    try:
+        generated = min(OUTPUT_PATH.stat().st_mtime, LEDGER_PATH.stat().st_mtime)
+    except OSError:
+        return True
+
+    if FEEDBACK_PATH.exists():
+        try:
+            if FEEDBACK_PATH.stat().st_mtime > generated:
+                return True
+        except OSError:
+            return True
+
+    if not SESSION_ROOT.exists():
+        return False
+    for path in SESSION_ROOT.rglob("*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime >= CUTOFF and stat.st_mtime > generated:
+            return True
+    return False
+
+
 def main() -> None:
+    if not sources_changed():
+        return
     turns = parse_sessions()
     enrich_outcomes(turns, load_feedback())
     for turn in turns:

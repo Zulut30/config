@@ -2233,6 +2233,13 @@ refreshModelQuality()
 codexModelQualityTimer = hs.timer.doEvery(1800, refreshModelQuality)
 
 function showCodexQuotaPanel()
+    local nativeDashboardPath =
+        "/Users/zulut/Documents/config/apps/CodexQuotaDashboard/dist/Codex Quota Dashboard.app"
+    if hs.fs.attributes(nativeDashboardPath) then
+        hs.execute(string.format("/usr/bin/open %q", nativeDashboardPath))
+        return
+    end
+
     local screen = hs.screen.mainScreen():frame()
     local panelWidth = math.min(1180, screen.w - 80)
     local panelHeight = math.min(780, screen.h - 80)
