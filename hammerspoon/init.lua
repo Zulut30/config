@@ -120,7 +120,7 @@ local function rankedTaskStats(stats)
 end
 
 local function openCodexQuotaDashboard()
-  hs.execute("/usr/bin/open -a 'Codex Quota'")
+  hs.execute("/usr/bin/open -n '/Users/zulut/Applications/Codex Quota.app' --args --show-dashboard")
 end
 
 local function infoItem(title)

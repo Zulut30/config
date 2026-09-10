@@ -2,6 +2,8 @@ import AppKit
 import Foundation
 import SwiftUI
 
+private let showsDashboardOnLaunch = CommandLine.arguments.contains("--show-dashboard")
+
 struct RateLimitWindow: Codable {
     let usedPercent: Int
     let durationMinutes: Int
@@ -327,6 +329,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
         refresh()
         refreshTimer = Timer.scheduledTimer(timeInterval: 600, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+
+        if showsDashboardOnLaunch {
+            DispatchQueue.main.async { [weak self] in
+                self?.showDashboard()
+            }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
