@@ -28,6 +28,8 @@ CUTOFF = time.time() - PERIOD_DAYS * 86400
 CACHED_INPUT_WEIGHT = 0.20
 OUTPUT_TOKEN_WEIGHT = 1.50
 REASONING_TOKEN_WEIGHT = 2.50
+RECENCY_HALF_LIFE_DAYS = 14.0
+OUTLIER_MAD_LIMIT = 3.5
 
 CORRECTION_RE = re.compile(
     r"(?:"
@@ -587,6 +589,74 @@ def comparable_score(index: float, samples: int) -> float:
     return 50.0 + (raw - 50.0) * reliability
 
 
+def recency_weight(timestamp: Any) -> float:
+    try:
+        age_days = max(0.0, (time.time() - float(timestamp or 0)) / 86400)
+    except (TypeError, ValueError):
+        age_days = PERIOD_DAYS
+    return 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def effective_sample_size(weights: list[float]) -> float:
+    positive = [weight for weight in weights if weight > 0]
+    if not positive:
+        return 0.0
+    total = sum(positive)
+    squares = sum(weight * weight for weight in positive)
+    concentration_size = total * total / squares if squares else 0.0
+    # Preserve the usual concentration penalty, but also discount a uniformly
+    # old sample instead of letting its scale cancel out of the formula.
+    return min(concentration_size, total)
+
+
+def safe_comparison_index(value: float, baseline: float) -> float:
+    if value <= 0 or baseline <= 0:
+        return 1.0
+    return value / baseline
+
+
+def weighted_median(values: list[tuple[float, float]]) -> float:
+    valid = sorted(
+        (float(value), float(weight))
+        for value, weight in values
+        if value > 0 and weight > 0
+    )
+    if not valid:
+        return 0.0
+    midpoint = sum(weight for _, weight in valid) / 2
+    cumulative = 0.0
+    for value, weight in valid:
+        cumulative += weight
+        if cumulative >= midpoint:
+            return value
+    return valid[-1][0]
+
+
+def robust_recent_median(samples: list[tuple[float, Any]]) -> float:
+    valid = [
+        (float(value), timestamp)
+        for value, timestamp in samples
+        if value is not None and float(value) > 0
+    ]
+    if not valid:
+        return 0.0
+
+    logs = [math.log(value) for value, _ in valid]
+    center = statistics.median(logs)
+    mad = statistics.median(abs(value - center) for value in logs)
+    spread = max(0.12, mad * 1.4826)
+    lower = center - OUTLIER_MAD_LIMIT * spread
+    upper = center + OUTLIER_MAD_LIMIT * spread
+    weighted_logs = [
+        (max(lower, min(upper, math.log(value))), recency_weight(timestamp))
+        for value, timestamp in valid
+    ]
+    result = weighted_median(
+        [(math.exp(value), weight) for value, weight in weighted_logs]
+    )
+    return result
+
+
 def weighted_available(parts: list[tuple[float | None, float]]) -> float:
     present = [(value, weight) for value, weight in parts if value is not None]
     if not present:
@@ -609,19 +679,23 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         if chain["accepted"] is True:
             accepted_by_category[chain["category"]].append(chain)
     category_token_baseline = {
-        category: statistics.median(
-            chain["tokensPerComplexity"]
-            for chain in items
-            if chain["tokensPerComplexity"] > 0
+        category: robust_recent_median(
+            [
+                (chain["tokensPerComplexity"], chain["startedAt"])
+                for chain in items
+                if chain["tokensPerComplexity"] > 0
+            ]
         )
         for category, items in accepted_by_category.items()
         if any(chain["tokensPerComplexity"] > 0 for chain in items)
     }
     category_time_baseline = {
-        category: statistics.median(
-            chain["secondsPerComplexity"]
-            for chain in items
-            if chain["secondsPerComplexity"] > 0
+        category: robust_recent_median(
+            [
+                (chain["secondsPerComplexity"], chain["startedAt"])
+                for chain in items
+                if chain["secondsPerComplexity"] > 0
+            ]
         )
         for category, items in accepted_by_category.items()
         if any(chain["secondsPerComplexity"] > 0 for chain in items)
@@ -733,22 +807,37 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
             ]
         )
 
-        token_indices = [
-            chain["tokensPerComplexity"]
-            / category_token_baseline[chain["category"]]
+        token_samples = [
+            (
+                chain["tokensPerComplexity"]
+                / category_token_baseline[chain["category"]],
+                chain["startedAt"],
+            )
             for chain in accepted_chains
             if chain["category"] in category_token_baseline
             and chain["tokensPerComplexity"] > 0
         ]
-        time_indices = [
-            chain["secondsPerComplexity"]
-            / category_time_baseline[chain["category"]]
+        time_samples = [
+            (
+                chain["secondsPerComplexity"]
+                / category_time_baseline[chain["category"]],
+                chain["startedAt"],
+            )
             for chain in accepted_chains
             if chain["category"] in category_time_baseline
             and chain["secondsPerComplexity"] > 0
         ]
-        token_index = statistics.median(token_indices) if token_indices else 1.0
-        time_index = statistics.median(time_indices) if time_indices else 1.0
+        token_index = robust_recent_median(token_samples) or 1.0
+        time_index = robust_recent_median(time_samples) or 1.0
+        accepted_weights = [recency_weight(chain["startedAt"]) for chain in accepted_chains]
+        turn_weights = [recency_weight(item["startedAt"]) for item in items]
+        chain_weights = [recency_weight(chain["startedAt"]) for chain in model_chains]
+        known_weights = [recency_weight(chain["startedAt"]) for chain in known_chains]
+        manual_weights = [
+            recency_weight(chain["startedAt"])
+            for chain in model_chains
+            if chain["manualFeedback"]
+        ]
         effective_tokens = sum(effective_token_cost(item) for item in items)
 
         raw_models.append(
@@ -782,6 +871,16 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
                 "outcomeScore": outcome_score,
                 "_tokenIndex": token_index,
                 "_timeIndex": time_index,
+                "_acceptedEvidence": effective_sample_size(accepted_weights),
+                "_effectiveTasks": effective_sample_size(turn_weights),
+                "_recentFeedbackCoverage": (
+                    sum(known_weights) / sum(chain_weights) if chain_weights else 0
+                ),
+                "_recentManualCoverage": min(
+                    1.0,
+                    sum(manual_weights) / max(1.0, sum(chain_weights)),
+                ),
+                "lastTaskAt": round(max(item["startedAt"] or 0 for item in items)),
                 "tokensPerAcceptedResult": (
                     statistics.median(
                         chain["totalTokens"] for chain in accepted_chains
@@ -814,10 +913,10 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
 
     for model in raw_models:
         efficiency_score = comparable_score(
-            model["_tokenIndex"], model["acceptedResults"]
+            model["_tokenIndex"], model["_acceptedEvidence"]
         )
         speed_score = comparable_score(
-            model["_timeIndex"], model["acceptedResults"]
+            model["_timeIndex"], model["_acceptedEvidence"]
         )
         model["efficiencyScore"] = round(efficiency_score)
         model["speedScore"] = round(speed_score)
@@ -837,11 +936,9 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         del model["_tokenIndex"]
         del model["_timeIndex"]
 
-        sample_confidence = 1 - math.exp(-model["tasks"] / 12)
-        feedback_coverage = (
-            model["evaluatedTasks"] / model["tasks"] if model["tasks"] else 0
-        )
-        manual_coverage = min(1.0, model["manualRatings"] / 5)
+        sample_confidence = 1 - math.exp(-model["_effectiveTasks"] / 10)
+        feedback_coverage = model["_recentFeedbackCoverage"]
+        manual_coverage = model["_recentManualCoverage"]
         signal_coverage = (
             (1 if model["commands"] else 0)
             + (1 if model["tests"] else 0)
@@ -854,7 +951,15 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
             + 0.15 * manual_coverage
         )
         model["confidence"] = round(max(0, min(100, confidence)))
+        model["effectiveSampleSize"] = round(model["_effectiveTasks"], 1)
+        model["freshnessDays"] = round(
+            max(0.0, (time.time() - model["lastTaskAt"]) / 86400), 1
+        )
         model["outcomeScore"] = round(model["outcomeScore"])
+        del model["_acceptedEvidence"]
+        del model["_effectiveTasks"]
+        del model["_recentFeedbackCoverage"]
+        del model["_recentManualCoverage"]
 
         for key in (
             "firstPassRate",
@@ -893,20 +998,40 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
             accepted = [chain for chain in model_chains if chain["accepted"] is True]
             if not known or not accepted:
                 continue
-            first_pass_count = sum(
-                chain["accepted"] and chain["attempts"] == 1 for chain in known
+            known_weights = [recency_weight(chain["startedAt"]) for chain in known]
+            first_pass_weight = sum(
+                recency_weight(chain["startedAt"])
+                for chain in known
+                if chain["accepted"] and chain["attempts"] == 1
             )
+            accepted_weights = [recency_weight(chain["startedAt"]) for chain in accepted]
             candidates.append(
                 {
                     "model": model,
                     "tasks": len(model_chains),
                     "known": len(known),
-                    "successProbability": (first_pass_count + 2) / (len(known) + 4),
-                    "acceptedCost": statistics.median(
-                        chain["totalTokens"] for chain in accepted
+                    "evidence": effective_sample_size(known_weights),
+                    "successProbability": bayesian_rate(
+                        first_pass_weight,
+                        sum(known_weights),
                     ),
-                    "acceptedSeconds": statistics.median(
-                        chain["activeSeconds"] for chain in accepted
+                    "acceptedCost": robust_recent_median(
+                        [(chain["totalTokens"], chain["startedAt"]) for chain in accepted]
+                    ),
+                    "economyCost": robust_recent_median(
+                        [
+                            (chain["tokensPerComplexity"], chain["startedAt"])
+                            for chain in accepted
+                        ]
+                    ),
+                    "acceptedSeconds": robust_recent_median(
+                        [(chain["activeSeconds"], chain["startedAt"]) for chain in accepted]
+                    ),
+                    "speedCost": robust_recent_median(
+                        [
+                            (chain["secondsPerComplexity"], chain["startedAt"])
+                            for chain in accepted
+                        ]
                     ),
                 }
             )
@@ -914,18 +1039,28 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         if not candidates:
             continue
         category_cost_median = statistics.median(
-            item["acceptedCost"] for item in candidates
+            item["economyCost"] for item in candidates
         )
         category_time_median = statistics.median(
-            item["acceptedSeconds"] for item in candidates
+            item["speedCost"] for item in candidates
         )
         for item in candidates:
             item["score"] = round(
-                item["successProbability"] * 70
-                + ratio_score(item["acceptedCost"], category_cost_median) * 0.20
-                + ratio_score(item["acceptedSeconds"], category_time_median) * 0.10
+                item["successProbability"] * 60
+                + comparable_score(
+                    safe_comparison_index(item["economyCost"], category_cost_median),
+                    item["evidence"],
+                )
+                * 0.25
+                + comparable_score(
+                    safe_comparison_index(item["speedCost"], category_time_median),
+                    item["evidence"],
+                )
+                * 0.15
             )
-            item["confidence"] = round(100 * (1 - math.exp(-item["known"] / 8)))
+            item["confidence"] = round(
+                100 * (1 - math.exp(-item["evidence"] / 7))
+            )
         best = max(candidates, key=lambda item: (item["score"], item["confidence"]))
         label = next(
             (
@@ -973,7 +1108,7 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
         }
 
     return {
-        "version": 2,
+        "version": 3,
         "generatedAt": int(time.time()),
         "periodDays": PERIOD_DAYS,
         "methodology": {
@@ -984,6 +1119,8 @@ def aggregate(turns: list[dict[str, Any]], chains: list[dict[str, Any]]) -> dict
             "firstPassShareOfResult": 25,
             "comparison": "category-and-complexity-normalized",
             "tokenMetric": "relative-effective-token-load",
+            "recencyHalfLifeDays": RECENCY_HALF_LIFE_DAYS,
+            "outlierMethod": "log-median-mad-winsorization",
             "note": (
                 "Relative local score, not quota accounting. Quality uses accepted "
                 "outcomes; economy and speed compare similar task categories after "
@@ -1019,6 +1156,12 @@ def sources_changed() -> bool:
         return True
     try:
         generated = min(OUTPUT_PATH.stat().st_mtime, LEDGER_PATH.stat().st_mtime)
+    except OSError:
+        return True
+
+    try:
+        if Path(__file__).stat().st_mtime > generated:
+            return True
     except OSError:
         return True
 
