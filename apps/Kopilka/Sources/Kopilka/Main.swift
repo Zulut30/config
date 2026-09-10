@@ -20,7 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let capture = CaptureService()
     let hotKeys = HotKeyManager()
     var window: NSWindow!
-    var statusItem: NSStatusItem!
     var composer: NSPanel?
     var toast: NSPanel?
     var toastTask: Task<Void, Never>?
@@ -182,19 +181,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let windowRoot = NSMenuItem(); windowRoot.submenu = windows; main.addItem(windowRoot)
         NSApp.mainMenu = main
         NSApp.windowsMenu = windows
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        let symbol = NSImage(systemSymbolName: "tray.and.arrow.down", accessibilityDescription: "Копилка")
-        symbol?.isTemplate = true
-        statusItem.button?.image = symbol
-        statusItem.button?.toolTip = "Копилка: быстро сохранить текст"
-        let statusMenu = NSMenu()
-        statusMenu.addItem(item("Открыть Копилку   ⌃⇧I", #selector(openLibrary)))
-        statusMenu.addItem(item("Сохранить из буфера", #selector(saveClipboard)))
-        statusMenu.addItem(item("Новая заметка…", #selector(newNote)))
-        statusMenu.addItem(.separator())
-        statusMenu.addItem(item("Настройки…", #selector(settings)))
-        statusMenu.addItem(item("Завершить Копилку", #selector(quit)))
-        statusItem.menu = statusMenu
     }
 
     @objc func captureText(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {

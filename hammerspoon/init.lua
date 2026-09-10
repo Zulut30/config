@@ -57,7 +57,19 @@ bind({"ctrl", "shift"}, "s", function()
 end)
 
 local codexQuotaFile = os.getenv("HOME") .. "/Library/Caches/CodexQuota/status.json"
-local codexQuotaMenu = hs.menubar.new()
+local codexQuotaMenu = {}
+function codexQuotaMenu:setTitle(_) return self end
+function codexQuotaMenu:setTooltip(_) return self end
+function codexQuotaMenu:setMenu(_) return self end
+function codexQuotaMenu:setClickCallback(_) return self end
+
+local nativeCodexQuotaDashboardPath =
+  "/Users/zulut/Documents/config/apps/CodexQuotaDashboard/dist/Codex Quota Dashboard.app"
+hs.timer.doAfter(1, function()
+  if hs.fs.attributes(nativeCodexQuotaDashboardPath) then
+    hs.execute(string.format("/usr/bin/open -gj %q", nativeCodexQuotaDashboardPath))
+  end
+end)
 
 local function resetText(timestamp)
   if not timestamp then return "время неизвестно" end
