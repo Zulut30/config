@@ -15,13 +15,13 @@ struct DashboardView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 250, ideal: 276, max: 310)
+                .navigationSplitViewColumnWidth(min: 300, ideal: 320, max: 350)
         } detail: {
             detail
         }
         .tint(DashboardPalette.accent)
         .font(.custom("Avenir Next", size: 13))
-        .environment(\.controlSize, .large)
+        .environment(\.controlSize, .regular)
         .fontDesign(.rounded)
         .onAppear {
             withAnimation(.easeOut(duration: 0.35)) {
@@ -80,8 +80,8 @@ struct DashboardView: View {
                 }
                 Spacer()
             }
-            .padding(.horizontal, 15)
-            .padding(.top, 17)
+            .padding(.horizontal, 22)
+            .padding(.top, 20)
             .padding(.bottom, 20)
 
             VStack(alignment: .leading, spacing: 7) {
@@ -96,9 +96,10 @@ struct DashboardView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                .controlSize(.small)
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 16)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 18)
 
             List(selection: $store.selectedModelName) {
                 Section("МОДЕЛИ") {
@@ -148,7 +149,8 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(14)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
         }
         .navigationTitle("Codex Quota")
     }
@@ -211,10 +213,17 @@ struct DashboardView: View {
     }
 
     private var heroRow: some View {
-        HStack(alignment: .top, spacing: 20) {
-            quotaCard
-                .frame(width: 304)
-            recommendationCard
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 20) {
+                quotaCard
+                    .frame(width: 304)
+                recommendationCard
+                    .frame(minWidth: 560)
+            }
+            VStack(spacing: 20) {
+                quotaCard
+                recommendationCard
+            }
         }
     }
 
@@ -243,6 +252,7 @@ struct DashboardView: View {
             }
         }
         .padding(19)
+        .frame(maxWidth: .infinity, minHeight: 150, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
         .overlay {
             RoundedRectangle(cornerRadius: 22)
@@ -263,6 +273,8 @@ struct DashboardView: View {
                         Text(model.name)
                             .font(.custom("Avenir Next Demi Bold", size: 25))
                             .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
                         Text("\(model.score(for: store.rankingMode))/100")
                             .font(.custom("Avenir Next Demi Bold", size: 14))
                             .foregroundStyle(Color.white.opacity(0.74))
@@ -271,6 +283,8 @@ struct DashboardView: View {
                         .font(.custom("Avenir Next", size: 11))
                         .foregroundStyle(Color.white.opacity(0.66))
                 }
+                .frame(minWidth: 210, idealWidth: 230, maxWidth: 260, alignment: .leading)
+                .layoutPriority(1)
                 Spacer()
                 recommendationMetric(
                     "Результат",
@@ -297,6 +311,7 @@ struct DashboardView: View {
                 }
             }
             .padding(24)
+            .frame(maxWidth: .infinity, minHeight: 150, alignment: .leading)
             .background(
                 LinearGradient(
                     colors: [
