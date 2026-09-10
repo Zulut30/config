@@ -5,11 +5,11 @@ struct DashboardView: View {
     @State private var appeared = false
 
     private let modelColumns = [
-        GridItem(.adaptive(minimum: 350), spacing: 16),
+        GridItem(.adaptive(minimum: 390), spacing: 20),
     ]
 
     private let categoryColumns = [
-        GridItem(.adaptive(minimum: 220), spacing: 12),
+        GridItem(.adaptive(minimum: 250), spacing: 16),
     ]
 
     var body: some View {
@@ -21,6 +21,8 @@ struct DashboardView: View {
         }
         .tint(DashboardPalette.accent)
         .font(.custom("Avenir Next", size: 13))
+        .environment(\.controlSize, .large)
+        .fontDesign(.rounded)
         .onAppear {
             withAnimation(.easeOut(duration: 0.35)) {
                 appeared = true
@@ -130,8 +132,8 @@ struct DashboardView: View {
                 }
             }
             .listStyle(.sidebar)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
 
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 7) {
@@ -173,7 +175,7 @@ struct DashboardView: View {
                     categorySection
                     methodology
                 }
-                .padding(28)
+                .padding(32)
                 .opacity(appeared ? 1 : 0)
                 .offset(y: appeared ? 0 : 8)
             }
@@ -209,9 +211,9 @@ struct DashboardView: View {
     }
 
     private var heroRow: some View {
-        HStack(alignment: .top, spacing: 16) {
+        HStack(alignment: .top, spacing: 20) {
             quotaCard
-                .frame(width: 282)
+                .frame(width: 304)
             recommendationCard
         }
     }
@@ -294,7 +296,7 @@ struct DashboardView: View {
                         .foregroundStyle(Color.white.opacity(0.72))
                 }
             }
-            .padding(21)
+            .padding(24)
             .background(
                 LinearGradient(
                     colors: [
@@ -316,8 +318,22 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(21)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
+            .padding(24)
+            .background(
+                LinearGradient(
+                    colors: [
+                        DashboardPalette.accent.opacity(0.16),
+                        Color.white.opacity(0.045),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(DashboardPalette.accent.opacity(0.22), lineWidth: 1)
+            }
         }
     }
 
@@ -340,7 +356,7 @@ struct DashboardView: View {
                 "Сравнение моделей",
                 "Нажми на карточку, чтобы закрепить модель в боковой панели"
             )
-            LazyVGrid(columns: modelColumns, spacing: 16) {
+            LazyVGrid(columns: modelColumns, spacing: 20) {
                 ForEach(store.sortedModels) { model in
                     ModelAnalyticsCard(
                         model: model,
@@ -367,7 +383,7 @@ struct DashboardView: View {
                     "Лучшие модели по типу задачи",
                     "Сравниваются только похожие задачи"
                 )
-                LazyVGrid(columns: categoryColumns, spacing: 12) {
+                LazyVGrid(columns: categoryColumns, spacing: 16) {
                     ForEach(categories) { item in
                         CategoryCard(item: item)
                     }
